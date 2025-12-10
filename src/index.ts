@@ -14,7 +14,7 @@ const port = env.PORT;
 fastify.route({
   method: ['GET', 'POST', 'PUT'],
   handler: serve({ client: inngest, functions: [processOcrJob] }),
-  url: '/api/inngest/*',
+  url: '/api/inngest',
 });
 
 // Health check endpoint
