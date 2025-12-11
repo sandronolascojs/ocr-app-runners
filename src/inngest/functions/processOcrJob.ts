@@ -106,8 +106,6 @@ type PersistableFrame = {
   text: string;
 };
 
-type SleepFn = (id: string, duration: string) => Promise<void>;
-
 const CROP_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24; // 24 hours
 
 const streamAndProcessZip = async ({
@@ -332,41 +330,22 @@ const createBatchArtifacts = async ({
   };
 };
 
-const waitForBatchCompletion = async ({
-  jobId,
+const checkBatchStatus = async ({
   batchId,
-  sleep,
   openai,
 }: {
-  jobId: string;
   batchId: string;
-  sleep: SleepFn;
   openai: OpenAI;
-}): Promise<string> => {
-  let attempt = 0;
-  while (true) {
-    const latestBatch = await openai.batches.retrieve(batchId);
+}): Promise<{
+  status: string;
+  outputFileId: string | null;
+}> => {
+  const latestBatch = await openai.batches.retrieve(batchId);
 
-    if (
-      latestBatch.status === "completed" &&
-      latestBatch.output_file_id
-    ) {
-      return latestBatch.output_file_id as string;
-    }
-
-    if (
-      latestBatch.status === "failed" ||
-      latestBatch.status === "cancelled"
-    ) {
-      throw new Error(`Batch failed with status=${latestBatch.status}`);
-    }
-
-    await sleep(
-      `${OcrSleepId.WaitBatchCompletion}-${jobId}-${attempt}`,
-      BATCH_SLEEP_INTERVAL
-    );
-    attempt += 1;
-  }
+  return {
+    status: latestBatch.status,
+    outputFileId: latestBatch.output_file_id as string | null,
+  };
 };
 
 const saveBatchResults = async ({
@@ -786,16 +765,50 @@ export const processOcrJob = inngest.createFunction(
 
           // Wait for this batch to complete before processing the next one
           // This ensures we don't exceed OpenAI rate limits and process sequentially
-          const batchOutputFileId = await step.run(
-            `${OcrStepId.WaitBatchCompletion}-${batchIndex}`,
-            () =>
-              waitForBatchCompletion({
-                jobId,
-                batchId: artifacts.batchId,
-                sleep: step.sleep,
-                openai,
-              })
-          );
+          // Use separate steps for each check to allow proper sleep handling
+          let batchOutputFileId: string | null = null;
+          let attempt = 0;
+          
+          while (true) {
+            const batchStatus = await step.run(
+              `${OcrStepId.WaitBatchCompletion}-${batchIndex}-${attempt}`,
+              () =>
+                checkBatchStatus({
+                  batchId: artifacts.batchId,
+                  openai,
+                })
+            );
+
+            if (
+              batchStatus.status === "completed" &&
+              batchStatus.outputFileId
+            ) {
+              batchOutputFileId = batchStatus.outputFileId;
+              break;
+            }
+
+            if (
+              batchStatus.status === "failed" ||
+              batchStatus.status === "cancelled"
+            ) {
+              throw new Error(
+                `Batch ${batchIndex} failed with status=${batchStatus.status}`
+              );
+            }
+
+            // Sleep before next check - this must be outside step.run
+            await step.sleep(
+              `${OcrSleepId.WaitBatchCompletion}-${jobId}-${batchIndex}-${attempt}`,
+              BATCH_SLEEP_INTERVAL
+            );
+            attempt += 1;
+          }
+
+          if (!batchOutputFileId) {
+            throw new Error(
+              `Batch ${batchIndex} completed but output file ID is missing`
+            );
+          }
 
           console.log(
             `Batch ${batchIndex + 1}/${totalBatches} completed for job ${jobId}`
