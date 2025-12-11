@@ -52,6 +52,7 @@ import {
 } from "@/utils/storage";
 
 const BATCH_SLEEP_INTERVAL = "20s";
+const BATCH_SIZE = 20;
 
 type CropMeta = {
   filename: string;
@@ -66,7 +67,7 @@ type WorkspacePaths = {
   cropsDir: string;
   txtPath: string;
   docxPath: string;
-  batchJsonlPath: string;
+  batchJsonlPath: string; // Legacy path, now using getJobBatchJsonlPath with batchIndex
   zipPath: string;
   rawArchivePath: string;
 };
@@ -88,6 +89,13 @@ type StreamingArtifacts = {
 type BatchArtifacts = {
   batchId: string;
   batchInputFileId: string;
+  batchIndex: number;
+};
+
+type ProcessedBatchResult = {
+  batchId: string;
+  batchOutputFileId: string;
+  batchIndex: number;
 };
 
 type PersistableFrame = {
@@ -230,24 +238,38 @@ const streamAndProcessZip = async ({
   };
 };
 
+/**
+ * Divides an array into chunks of specified size
+ */
+const chunkArray = <T>(array: T[], chunkSize: number): T[][] => {
+  const chunks: T[][] = [];
+  for (let i = 0; i < array.length; i += chunkSize) {
+    chunks.push(array.slice(i, i + chunkSize));
+  }
+  return chunks;
+};
+
 const createBatchArtifacts = async ({
   jobId,
   cropsMeta,
-  paths,
+  batchIndex,
+  globalStartIndex,
   openai,
 }: {
   jobId: string;
   cropsMeta: CropMeta[];
-  paths: WorkspacePaths;
+  batchIndex: number;
+  globalStartIndex: number;
   openai: OpenAI;
 }): Promise<BatchArtifacts> => {
   if (!cropsMeta.length) {
     throw new Error(
-      `No crops found for job ${jobId} when creating Batch artifacts.`
+      `No crops found for job ${jobId} batch ${batchIndex} when creating Batch artifacts.`
     );
   }
 
-  const jsonlStream = fsSync.createWriteStream(paths.batchJsonlPath, {
+  const batchJsonlPath = getJobBatchJsonlPath(jobId, batchIndex);
+  const jsonlStream = fsSync.createWriteStream(batchJsonlPath, {
     encoding: "utf8",
   });
 
@@ -257,10 +279,11 @@ const createBatchArtifacts = async ({
     jsonlStream.on("finish", () => resolve());
   });
 
-  // Write all lines
-  for (let index = 0; index < cropsMeta.length; index++) {
-    const { filename, cropSignedUrl } = cropsMeta[index];
-    const customId = `job-${jobId}-frame-${index}-${filename}`;
+  // Write all lines for this batch chunk
+  for (let localIndex = 0; localIndex < cropsMeta.length; localIndex++) {
+    const { filename, cropSignedUrl } = cropsMeta[localIndex];
+    const globalIndex = globalStartIndex + localIndex;
+    const customId = `job-${jobId}-batch-${batchIndex}-frame-${globalIndex}-${filename}`;
 
     const line = {
       custom_id: customId,
@@ -292,7 +315,7 @@ const createBatchArtifacts = async ({
   await streamPromise;
 
   const inputFile = await openai.files.create({
-    file: fsSync.createReadStream(paths.batchJsonlPath),
+    file: fsSync.createReadStream(batchJsonlPath),
     purpose: "batch",
   });
 
@@ -302,17 +325,10 @@ const createBatchArtifacts = async ({
     completion_window: "24h",
   });
 
-  await db
-    .update(ocrJobs)
-    .set({
-      batchId: batch.id,
-      batchInputFileId: inputFile.id,
-    })
-    .where(eq(ocrJobs.jobId, jobId));
-
   return {
     batchId: batch.id,
     batchInputFileId: inputFile.id,
+    batchIndex,
   };
 };
 
@@ -355,51 +371,37 @@ const waitForBatchCompletion = async ({
 
 const saveBatchResults = async ({
   jobId,
-  batchOutputFileId,
+  processedBatches,
   totalImages,
   openai,
 }: {
   jobId: string;
-  batchOutputFileId: string;
+  processedBatches: ProcessedBatchResult[];
   totalImages: number;
   openai: OpenAI;
 }) => {
-  const outputStream = await openai.files.content(batchOutputFileId);
-  const outputBuffer = Buffer.from(await outputStream.arrayBuffer());
-  const outputJsonl = outputBuffer.toString("utf8");
-
-  const lines = outputJsonl
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-
-  if (!lines.length) {
-    throw new Error("Batch output file is empty.");
-  }
-
-  if (totalImages > 0 && lines.length !== totalImages) {
-    throw new Error(
-      `Batch output mismatch: expected ${totalImages} responses but got ${lines.length}.`
-    );
-  }
-
   const framesToPersist: PersistableFrame[] = [];
+  let totalProcessedLines = 0;
 
-  for (const line of lines) {
-    let parsed: {
-      custom_id?: string;
-      error?: { message?: string; code?: string };
-      response?: {
-        body?: {
-          choices?: Array<{
-            message?: { content?: ChatCompletionContent };
-          }>;
-        };
-      };
-    };
+  // Process each batch output file
+  for (const { batchOutputFileId, batchIndex } of processedBatches) {
+    const outputStream = await openai.files.content(batchOutputFileId);
+    const outputBuffer = Buffer.from(await outputStream.arrayBuffer());
+    const outputJsonl = outputBuffer.toString("utf8");
 
-    try {
-      parsed = JSON.parse(line) as {
+    const lines = outputJsonl
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    if (!lines.length) {
+      throw new Error(
+        `Batch ${batchIndex} output file is empty for job ${jobId}.`
+      );
+    }
+
+    for (const line of lines) {
+      let parsed: {
         custom_id?: string;
         error?: { message?: string; code?: string };
         response?: {
@@ -410,57 +412,82 @@ const saveBatchResults = async ({
           };
         };
       };
-    } catch (error) {
-      throw new Error(
-        `Invalid JSON line in batch output: ${(error as Error).message}`
-      );
+
+      try {
+        parsed = JSON.parse(line) as {
+          custom_id?: string;
+          error?: { message?: string; code?: string };
+          response?: {
+            body?: {
+              choices?: Array<{
+                message?: { content?: ChatCompletionContent };
+              }>;
+            };
+          };
+        };
+      } catch (error) {
+        throw new Error(
+          `Invalid JSON line in batch ${batchIndex} output: ${(error as Error).message}`
+        );
+      }
+
+      if (parsed.error) {
+        const message =
+          parsed.error?.message ??
+          parsed.error?.code ??
+          "Unknown OpenAI batch error";
+        throw new Error(
+          `OpenAI batch ${batchIndex} entry failed (${parsed.custom_id ?? "unknown"}): ${message}`
+        );
+      }
+
+      const customId = parsed.custom_id;
+      if (!customId) {
+        continue;
+      }
+
+      // Updated regex to match new custom_id format: job-{jobId}-batch-{batchIndex}-frame-{globalIndex}-{filename}
+      const match = customId.match(/^job-(.+)-batch-(\d+)-frame-(\d+)-(.+)$/);
+      if (!match) {
+        continue;
+      }
+
+      const [, , , indexAsString, filename] = match;
+      const index = Number.parseInt(indexAsString, 10);
+      if (Number.isNaN(index)) {
+        continue;
+      }
+
+      const completion =
+        parsed.response?.body?.choices?.[0]?.message?.content;
+      const text = extractTextFromCompletion(completion);
+
+      if (!text || text === "<EMPTY>") {
+        continue;
+      }
+
+      framesToPersist.push({
+        jobId,
+        filename,
+        baseKey: getBaseKeyFromFilename(filename),
+        index,
+        text,
+      });
+
+      totalProcessedLines += 1;
     }
+  }
 
-    if (parsed.error) {
-      const message =
-        parsed.error?.message ??
-        parsed.error?.code ??
-        "Unknown OpenAI batch error";
-      throw new Error(
-        `OpenAI batch entry failed (${parsed.custom_id ?? "unknown"}): ${message}`
-      );
-    }
-
-    const customId = parsed.custom_id;
-    if (!customId) {
-      continue;
-    }
-
-    const match = customId.match(/^job-(.+)-frame-(\d+)-(.+)$/);
-    if (!match) {
-      continue;
-    }
-
-    const [, , indexAsString, filename] = match;
-    const index = Number.parseInt(indexAsString, 10);
-    if (Number.isNaN(index)) {
-      continue;
-    }
-
-    const completion =
-      parsed.response?.body?.choices?.[0]?.message?.content;
-    const text = extractTextFromCompletion(completion);
-
-    if (!text || text === "<EMPTY>") {
-      continue;
-    }
-
-    framesToPersist.push({
-      jobId,
-      filename,
-      baseKey: getBaseKeyFromFilename(filename),
-      index,
-      text,
-    });
+  if (totalImages > 0 && totalProcessedLines !== totalImages) {
+    throw new Error(
+      `Batch output mismatch: expected ${totalImages} responses but got ${totalProcessedLines} across ${processedBatches.length} batches.`
+    );
   }
 
   if (!framesToPersist.length) {
-    throw new Error("No OCR frames were parsed from the batch output.");
+    throw new Error(
+      `No OCR frames were parsed from the batch outputs (${processedBatches.length} batches).`
+    );
   }
 
   await db.delete(ocrJobFrames).where(eq(ocrJobFrames.jobId, jobId));
@@ -476,10 +503,12 @@ const buildDocuments = async ({
   jobId,
   paths,
   storageKeys,
+  totalImages,
 }: {
   jobId: string;
   paths: WorkspacePaths;
   storageKeys: StorageKeys;
+  totalImages: number;
 }): Promise<string | null> => {
   const frames = await db
     .select()
@@ -532,11 +561,34 @@ const buildDocuments = async ({
   const dirsToRemove = [paths.rawDir, paths.normalizedDir, paths.cropsDir];
   const filesToRemove = [
     paths.zipPath,
-    paths.batchJsonlPath,
     paths.txtPath,
     paths.docxPath,
     paths.rawArchivePath,
   ];
+
+  // Remove all batch JSONL files (legacy and new batch-indexed files)
+  // Try to remove the legacy file first
+  try {
+    await fs.unlink(paths.batchJsonlPath);
+  } catch {
+    // ignore
+  }
+
+  // Remove all batch-indexed files
+  // Calculate the number of batches based on totalImages
+  const numberOfBatches = Math.ceil(totalImages / BATCH_SIZE);
+  // Add a buffer to ensure we clean up all files even if there's a slight mismatch
+  const maxBatchesToCheck = numberOfBatches + 10;
+  
+  for (let i = 0; i < maxBatchesToCheck; i++) {
+    try {
+      const batchPath = getJobBatchJsonlPath(jobId, i);
+      await fs.unlink(batchPath);
+    } catch {
+      // File doesn't exist or already removed, continue to next
+      // Don't break here as batches might not be sequential if there were errors
+    }
+  }
 
   for (const file of filesToRemove) {
     try {
@@ -651,9 +703,6 @@ export const processOcrJob = inngest.createFunction(
       // Estado actual en memoria (se irá actualizando manualmente)
       let currentStep: JobStep = job.step ?? JobStep.PREPROCESSING;
       let totalImages = job.totalImages ?? 0;
-      let batchId = job.batchId ?? null;
-      let batchInputFileId = job.batchInputFileId ?? null;
-      let batchOutputFileId = job.batchOutputFileId ?? null;
 
       const workspacePaths = buildWorkspacePaths(jobId);
       const storageKeys = buildStorageKeys(jobId);
@@ -694,56 +743,99 @@ export const processOcrJob = inngest.createFunction(
       currentStep = JobStep.BATCH_SUBMITTED;
 
       if (currentStep === JobStep.BATCH_SUBMITTED) {
-        if (!batchId || !batchInputFileId) {
+        // Divide cropsMeta into chunks of BATCH_SIZE (no limit on number of batches)
+        const cropsChunks = chunkArray(cropsMeta, BATCH_SIZE);
+        const processedBatches: ProcessedBatchResult[] = [];
+        const totalBatches = cropsChunks.length;
+
+        console.log(
+          `Processing ${totalImages} images in ${totalBatches} batches of ${BATCH_SIZE} images each for job ${jobId}`
+        );
+
+        // Process each batch chunk sequentially - wait for each batch to complete before starting the next
+        for (let batchIndex = 0; batchIndex < cropsChunks.length; batchIndex++) {
+          const chunk = cropsChunks[batchIndex];
+          const globalStartIndex = batchIndex * BATCH_SIZE;
+
+          console.log(
+            `Creating batch ${batchIndex + 1}/${totalBatches} for job ${jobId} (images ${globalStartIndex + 1}-${globalStartIndex + chunk.length})`
+          );
+
+          // Create batch artifacts (JSONL file and OpenAI batch)
           const artifacts = await step.run(
-            OcrStepId.CreateAndAwaitBatch,
+            `${OcrStepId.CreateAndAwaitBatch}-${batchIndex}`,
             () =>
               createBatchArtifacts({
                 jobId,
-                cropsMeta,
-                paths: workspacePaths,
+                cropsMeta: chunk,
+                batchIndex,
+                globalStartIndex,
                 openai,
               })
           );
-          batchId = artifacts.batchId;
-          batchInputFileId = artifacts.batchInputFileId;
+
+          if (!artifacts.batchId) {
+            throw new Error(
+              `Batch ID missing after creation for batch ${batchIndex}.`
+            );
+          }
+
+          console.log(
+            `Waiting for batch ${batchIndex + 1}/${totalBatches} (batchId: ${artifacts.batchId}) to complete for job ${jobId}`
+          );
+
+          // Wait for this batch to complete before processing the next one
+          // This ensures we don't exceed OpenAI rate limits and process sequentially
+          const batchOutputFileId = await step.run(
+            `${OcrStepId.WaitBatchCompletion}-${batchIndex}`,
+            () =>
+              waitForBatchCompletion({
+                jobId,
+                batchId: artifacts.batchId,
+                sleep: step.sleep,
+                openai,
+              })
+          );
+
+          console.log(
+            `Batch ${batchIndex + 1}/${totalBatches} completed for job ${jobId}`
+          );
+
+          processedBatches.push({
+            batchId: artifacts.batchId,
+            batchOutputFileId,
+            batchIndex,
+          });
+
+          // Update job with the last batch info (for tracking purposes)
+          await db
+            .update(ocrJobs)
+            .set({
+              batchId: artifacts.batchId,
+              batchInputFileId: artifacts.batchInputFileId,
+              batchOutputFileId,
+            })
+            .where(eq(ocrJobs.jobId, jobId));
         }
 
-        if (!batchId) {
-          throw new Error("Batch ID missing after creation.");
-        }
-
-        batchOutputFileId = await waitForBatchCompletion({
-          jobId,
-          batchId,
-          sleep: step.sleep,
-          openai,
-        });
+        console.log(
+          `All ${totalBatches} batches completed for job ${jobId}. Processing results...`
+        );
 
         await db
           .update(ocrJobs)
           .set({
-            batchOutputFileId,
             step: JobStep.RESULTS_SAVED,
           })
           .where(eq(ocrJobs.jobId, jobId));
 
         currentStep = JobStep.RESULTS_SAVED;
-      }
 
-      if (!batchOutputFileId) {
-        batchOutputFileId = job.batchOutputFileId ?? null;
-      }
-
-      if (currentStep === JobStep.RESULTS_SAVED) {
-        if (!batchOutputFileId) {
-          throw new Error("Batch output file id missing");
-        }
-
+        // Save all batch results
         await step.run(OcrStepId.SaveResultsToDb, () =>
           saveBatchResults({
             jobId,
-            batchOutputFileId,
+            processedBatches,
             totalImages,
             openai,
           })
@@ -758,6 +850,7 @@ export const processOcrJob = inngest.createFunction(
             jobId,
             paths: workspacePaths,
             storageKeys,
+            totalImages,
           })
         );
 

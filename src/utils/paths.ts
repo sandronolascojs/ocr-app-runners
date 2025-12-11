@@ -283,8 +283,9 @@ export function getJobDocxPath(jobId: string) {
   return path.join(VOLUME_DIRS.wordBase, `${jobId}.docx`);
 }
 
-export function getJobBatchJsonlPath(jobId: string) {
-  return path.join(VOLUME_DIRS.tmpBase, `${jobId}-ocr-batch.jsonl`);
+export function getJobBatchJsonlPath(jobId: string, batchIndex?: number) {
+  const suffix = batchIndex !== undefined ? `-batch-${batchIndex}` : "";
+  return path.join(VOLUME_DIRS.tmpBase, `${jobId}-ocr${suffix}.jsonl`);
 }
 
 export function getJobRawArchivePath(jobId: string) {
