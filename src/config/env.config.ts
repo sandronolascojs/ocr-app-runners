@@ -21,7 +21,6 @@ export const env = createEnv({
       .int()
       .positive()
       .default(900),
-    INNGEST_BASE_URL: z.url(),
   },
   runtimeEnv: process.env,
 });
