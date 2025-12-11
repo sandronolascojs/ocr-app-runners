@@ -1,7 +1,11 @@
 import { serve } from 'inngest/fastify';
 import Fastify from 'fastify';
 import { inngest } from './inngest/client';
-import { processOcrJob } from './inngest/functions/processOcrJob';
+import { preprocessZip } from './inngest/functions/preprocessZip';
+import { createBatch } from './inngest/functions/createBatch';
+import { waitForBatch } from './inngest/functions/waitForBatch';
+import { processAllBatches } from './inngest/functions/processAllBatches';
+import { buildDocuments } from './inngest/functions/buildDocuments';
 import { env } from './config/env.config';
 
 const fastify = Fastify({
@@ -13,7 +17,16 @@ const port = env.PORT;
 // Inngest serve endpoint
 fastify.route({
   method: ['GET', 'POST', 'PUT'],
-  handler: serve({ client: inngest, functions: [processOcrJob] }),
+  handler: serve({
+    client: inngest,
+    functions: [
+      preprocessZip,
+      createBatch,
+      waitForBatch,
+      processAllBatches,
+      buildDocuments,
+    ],
+  }),
   url: '/api/inngest',
 });
 
