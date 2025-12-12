@@ -114,13 +114,13 @@ const streamAndProcessZip = async ({
   zipKey,
   storageKeys,
   cropsMetaPath,
-  onProgress,
+  onTotalImages,
 }: {
   jobId: string;
   zipKey: string;
   storageKeys: StorageKeys;
   cropsMetaPath: string;
-  onProgress?: (count: number) => Promise<void>;
+  onTotalImages?: (count: number) => Promise<void>;
 }): Promise<StreamingArtifacts> => {
   const zipReadable = await downloadObjectStream(zipKey);
   const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
@@ -211,8 +211,8 @@ const streamAndProcessZip = async ({
     }
 
     processedImages += 1;
-    if (onProgress && processedImages % 50 === 0) {
-      await onProgress(processedImages);
+    if (onTotalImages && processedImages % 50 === 0) {
+      await onTotalImages(processedImages);
     }
   }
 
@@ -229,8 +229,8 @@ const streamAndProcessZip = async ({
 
   await fs.writeFile(cropsMetaPath, JSON.stringify(sortedCrops), "utf8");
 
-  if (onProgress) {
-    await onProgress(processedImages);
+  if (onTotalImages) {
+    await onTotalImages(processedImages);
   }
 
   return {
@@ -632,9 +632,6 @@ type ProgressState = {
   batchesCompleted: number;
 };
 
-const serializeProgress = (progress: ProgressState): string =>
-  JSON.stringify(progress);
-
 const buildProgress = (overrides?: Partial<ProgressState>): ProgressState => ({
   totalImages: 0,
   processedImages: 0,
@@ -643,16 +640,6 @@ const buildProgress = (overrides?: Partial<ProgressState>): ProgressState => ({
   batchesCompleted: 0,
   ...overrides,
 });
-
-const parseProgress = (value: string | null): ProgressState => {
-  if (!value) return buildProgress();
-  try {
-    const parsed = JSON.parse(value) as ProgressState;
-    return buildProgress(parsed);
-  } catch {
-    return buildProgress();
-  }
-};
 
 const persistProgress = async (
   jobId: string,
@@ -667,11 +654,13 @@ const persistProgress = async (
       totalBatches: progress.totalBatches,
       batchesCompleted: progress.batchesCompleted,
       submittedImages: progress.submittedImages,
-      error: serializeProgress(progress),
       ...extra,
     })
     .where(eq(ocrJobs.jobId, jobId));
 };
+
+// --- Helpers de flujo ---
+
 
 export const processOcrJob = inngest.createFunction(
   {
@@ -724,7 +713,13 @@ export const processOcrJob = inngest.createFunction(
         .where(eq(ocrJobs.jobId, jobId))
         .limit(1);
 
-      let progress = parseProgress(job?.error ?? null);
+      let progress = buildProgress({
+        totalImages: job.totalImages ?? 0,
+        processedImages: job.processedImages ?? 0,
+        submittedImages: job.submittedImages ?? 0,
+        totalBatches: job.totalBatches ?? 0,
+        batchesCompleted: job.batchesCompleted ?? 0,
+      });
 
       if (!job) {
         console.error("Job not found", jobId);
@@ -743,19 +738,25 @@ export const processOcrJob = inngest.createFunction(
 
       const workspacePaths = buildWorkspacePaths(jobId);
       const storageKeys = buildStorageKeys(jobId);
-  const cropsMetaPath = path.join(workspacePaths.cropsDir, "cropsMeta.json");
+      const cropsMetaPath = path.join(workspacePaths.cropsDir, "cropsMeta.json");
       let rawZipKeyForJob: string | null = job.rawZipPath ?? null;
+
+      // If already completed, short-circuit (avoid reading missing temp files)
+      if (
+        (job.step === JobStep.DOCS_BUILT || job.step === JobStep.RESULTS_SAVED) &&
+        job.txtPath &&
+        job.docxPath
+      ) {
+        return {
+          jobId,
+          txtKey: job.txtPath,
+          docxKey: job.docxPath,
+          rawZipKey: rawZipKeyForJob,
+        };
+      }
 
       await ensureWorkspaceLayout(workspacePaths);
 
-      // Inicializar progreso para este run de preprocesado
-      progress = buildProgress({
-        totalImages: 0,
-        processedImages: 0,
-        submittedImages: 0,
-        totalBatches: 0,
-        batchesCompleted: 0,
-      });
       await persistProgress(jobId, progress, {
         step: JobStep.PREPROCESSING,
         status: JobsStatus.PROCESSING,
@@ -769,9 +770,9 @@ export const processOcrJob = inngest.createFunction(
             zipKey: storageZipKey,
             storageKeys,
             cropsMetaPath,
-            onProgress: async (count) => {
+            onTotalImages: async (count) => {
+              // Solo actualizamos el total de imágenes detectadas en el ZIP
               progress.totalImages = count;
-              // Durante preprocesado aún no hay imágenes enviadas ni completadas
               await persistProgress(jobId, progress, {
                 step: JobStep.PREPROCESSING,
                 status: JobsStatus.PROCESSING,
@@ -801,6 +802,18 @@ export const processOcrJob = inngest.createFunction(
         batchInputFileId: null,
         batchOutputFileId: null,
       });
+
+      if (!fsSync.existsSync(cropsMetaPath)) {
+        console.warn(
+          `cropsMeta.json missing for job ${jobId}; assuming processing already completed or temp cleaned.`
+        );
+        return {
+          jobId,
+          txtKey: job.txtPath ?? "",
+          docxKey: job.docxPath ?? "",
+          rawZipKey: rawZipKeyForJob,
+        };
+      }
 
       const cropsMeta: CropMeta[] = JSON.parse(
         fsSync.readFileSync(cropsMetaPath, "utf8")
