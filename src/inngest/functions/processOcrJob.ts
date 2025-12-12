@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import fsSync from "node:fs";
+import path from "node:path";
 import archiver from "archiver";
 import { Transform } from "node:stream";
 import unzipper from "unzipper";
@@ -79,11 +80,11 @@ type StorageKeys = {
 };
 
 type StreamingArtifacts = {
-  cropsMeta: CropMeta[];
   totalImages: number;
   rawZipKey: string | null;
   rawZipSizeBytes: number | null;
   thumbnailKey: string | null;
+  cropsMetaPath: string;
 };
 
 type BatchArtifacts = {
@@ -112,10 +113,12 @@ const streamAndProcessZip = async ({
   jobId,
   zipKey,
   storageKeys,
+  cropsMetaPath,
 }: {
   jobId: string;
   zipKey: string;
   storageKeys: StorageKeys;
+  cropsMetaPath: string;
 }): Promise<StreamingArtifacts> => {
   const zipReadable = await downloadObjectStream(zipKey);
   const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
@@ -227,12 +230,14 @@ const streamAndProcessZip = async ({
     return a.filename.localeCompare(b.filename);
   });
 
+  await fs.writeFile(cropsMetaPath, JSON.stringify(sortedCrops), "utf8");
+
   return {
-    cropsMeta: sortedCrops,
     totalImages: processedImages,
     rawZipKey: processedImages > 0 ? storageKeys.rawZipKey : null,
     rawZipSizeBytes: processedImages > 0 ? filteredZipSizeBytes : null,
     thumbnailKey,
+    cropsMetaPath,
   };
 };
 
@@ -543,6 +548,7 @@ const buildDocuments = async ({
     paths.txtPath,
     paths.docxPath,
     paths.rawArchivePath,
+    path.join(paths.cropsDir, "cropsMeta.json"),
   ];
 
   // Remove all batch JSONL files (legacy and new batch-indexed files)
@@ -685,6 +691,7 @@ export const processOcrJob = inngest.createFunction(
 
       const workspacePaths = buildWorkspacePaths(jobId);
       const storageKeys = buildStorageKeys(jobId);
+  const cropsMetaPath = path.join(workspacePaths.cropsDir, "cropsMeta.json");
       let rawZipKeyForJob: string | null = job.rawZipPath ?? null;
 
       await ensureWorkspaceLayout(workspacePaths);
@@ -696,6 +703,7 @@ export const processOcrJob = inngest.createFunction(
             jobId,
             zipKey: storageZipKey,
             storageKeys,
+        cropsMetaPath,
           })
       );
 
@@ -715,7 +723,9 @@ export const processOcrJob = inngest.createFunction(
         })
         .where(eq(ocrJobs.jobId, jobId));
 
-      const cropsMeta: CropMeta[] = streamingResult.cropsMeta;
+  const cropsMeta: CropMeta[] = JSON.parse(
+    fsSync.readFileSync(cropsMetaPath, "utf8")
+  ) as CropMeta[];
       if (!cropsMeta.length) {
         throw new Error("No crops were generated from the provided ZIP file.");
       }

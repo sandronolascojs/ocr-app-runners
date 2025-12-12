@@ -11,6 +11,7 @@
 !.yarn/versions
 mnt
 db_data
+scripts
 
 # testing
 /coverage
