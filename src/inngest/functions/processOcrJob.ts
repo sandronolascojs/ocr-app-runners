@@ -114,11 +114,13 @@ const streamAndProcessZip = async ({
   zipKey,
   storageKeys,
   cropsMetaPath,
+  onProgress,
 }: {
   jobId: string;
   zipKey: string;
   storageKeys: StorageKeys;
   cropsMetaPath: string;
+  onProgress?: (count: number) => Promise<void>;
 }): Promise<StreamingArtifacts> => {
   const zipReadable = await downloadObjectStream(zipKey);
   const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
@@ -209,6 +211,9 @@ const streamAndProcessZip = async ({
     }
 
     processedImages += 1;
+    if (onProgress && processedImages % 50 === 0) {
+      await onProgress(processedImages);
+    }
   }
 
   await archive.finalize();
@@ -223,6 +228,10 @@ const streamAndProcessZip = async ({
   });
 
   await fs.writeFile(cropsMetaPath, JSON.stringify(sortedCrops), "utf8");
+
+  if (onProgress) {
+    await onProgress(processedImages);
+  }
 
   return {
     totalImages: processedImages,
@@ -739,6 +748,19 @@ export const processOcrJob = inngest.createFunction(
 
       await ensureWorkspaceLayout(workspacePaths);
 
+      // Inicializar progreso para este run de preprocesado
+      progress = buildProgress({
+        totalImages: 0,
+        processedImages: 0,
+        submittedImages: 0,
+        totalBatches: 0,
+        batchesCompleted: 0,
+      });
+      await persistProgress(jobId, progress, {
+        step: JobStep.PREPROCESSING,
+        status: JobsStatus.PROCESSING,
+      });
+
       const streamingResult = await step.run(
         OcrStepId.PreprocessImagesAndCrops,
         () =>
@@ -747,6 +769,14 @@ export const processOcrJob = inngest.createFunction(
             zipKey: storageZipKey,
             storageKeys,
             cropsMetaPath,
+            onProgress: async (count) => {
+              progress.totalImages = count;
+              // Durante preprocesado aún no hay imágenes enviadas ni completadas
+              await persistProgress(jobId, progress, {
+                step: JobStep.PREPROCESSING,
+                status: JobsStatus.PROCESSING,
+              });
+            },
           })
       );
 
