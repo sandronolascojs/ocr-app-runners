@@ -27,6 +27,11 @@ export const ocrJobs = pgTable("ocr_jobs", {
   batchInputFileId: text("batch_input_file_id"),
   batchOutputFileId: text("batch_output_file_id"),
 
+  // Batch progress tracking
+  totalBatches: integer("total_batches").notNull().default(0),
+  batchesCompleted: integer("batches_completed").notNull().default(0),
+  submittedImages: integer("submitted_images").notNull().default(0),
+
   totalImages: integer("total_images").notNull().default(0),
   processedImages: integer("processed_images").notNull().default(0),
 

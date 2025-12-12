@@ -53,7 +53,7 @@ import {
 } from "@/utils/storage";
 
 const BATCH_SLEEP_INTERVAL = "20s";
-const BATCH_SIZE = 20;
+const BATCH_SIZE = 1000;
 
 type CropMeta = {
   filename: string;
@@ -209,14 +209,6 @@ const streamAndProcessZip = async ({
     }
 
     processedImages += 1;
-    await db
-      .update(ocrJobs)
-      .set({
-        processedImages,
-        totalImages: processedImages,
-        status: JobsStatus.PROCESSING,
-      })
-      .where(eq(ocrJobs.jobId, jobId));
   }
 
   await archive.finalize();
@@ -295,7 +287,7 @@ const createBatchArtifacts = async ({
       body: {
         model: AI_CONSTANTS.MODELS.OPENAI,
         temperature: 0,
-        max_tokens: 96,
+        max_tokens: 32,
         messages: [
           {
             role: "user",
@@ -479,7 +471,7 @@ const saveBatchResults = async ({
 
   await db
     .update(ocrJobs)
-    .set({ step: JobStep.DOCS_BUILT })
+    .set({ step: JobStep.DOCS_BUILT, processedImages: totalProcessedLines })
     .where(eq(ocrJobs.jobId, jobId));
 };
 
@@ -623,6 +615,55 @@ const ensureWorkspaceLayout = async (paths: WorkspacePaths) => {
   await fs.mkdir(VOLUME_DIRS.tmpBase, { recursive: true });
 };
 
+type ProgressState = {
+  totalImages: number;
+  processedImages: number; // completadas por OpenAI
+  submittedImages: number; // enviadas a OpenAI
+  totalBatches: number;
+  batchesCompleted: number;
+};
+
+const serializeProgress = (progress: ProgressState): string =>
+  JSON.stringify(progress);
+
+const buildProgress = (overrides?: Partial<ProgressState>): ProgressState => ({
+  totalImages: 0,
+  processedImages: 0,
+  submittedImages: 0,
+  totalBatches: 0,
+  batchesCompleted: 0,
+  ...overrides,
+});
+
+const parseProgress = (value: string | null): ProgressState => {
+  if (!value) return buildProgress();
+  try {
+    const parsed = JSON.parse(value) as ProgressState;
+    return buildProgress(parsed);
+  } catch {
+    return buildProgress();
+  }
+};
+
+const persistProgress = async (
+  jobId: string,
+  progress: ProgressState,
+  extra?: Record<string, unknown>
+) => {
+  await db
+    .update(ocrJobs)
+    .set({
+      processedImages: progress.processedImages,
+      totalImages: progress.totalImages,
+      totalBatches: progress.totalBatches,
+      batchesCompleted: progress.batchesCompleted,
+      submittedImages: progress.submittedImages,
+      error: serializeProgress(progress),
+      ...extra,
+    })
+    .where(eq(ocrJobs.jobId, jobId));
+};
+
 export const processOcrJob = inngest.createFunction(
   {
     id: InngestFunctions.PROCESS_OCR_JOB,
@@ -674,6 +715,8 @@ export const processOcrJob = inngest.createFunction(
         .where(eq(ocrJobs.jobId, jobId))
         .limit(1);
 
+      let progress = parseProgress(job?.error ?? null);
+
       if (!job) {
         console.error("Job not found", jobId);
         return { jobId, txtKey: "", docxKey: "", rawZipKey: null };
@@ -703,29 +746,35 @@ export const processOcrJob = inngest.createFunction(
             jobId,
             zipKey: storageZipKey,
             storageKeys,
-        cropsMetaPath,
+            cropsMetaPath,
           })
       );
 
       totalImages = streamingResult.totalImages;
       rawZipKeyForJob = streamingResult.rawZipKey;
 
-      await db
-        .update(ocrJobs)
-        .set({
-          rawZipPath: streamingResult.rawZipKey,
-          rawZipSizeBytes: streamingResult.rawZipSizeBytes,
-          thumbnailKey: streamingResult.thumbnailKey,
-          step: JobStep.BATCH_SUBMITTED,
-          totalImages,
-          processedImages: totalImages,
-          status: JobsStatus.PROCESSING,
-        })
-        .where(eq(ocrJobs.jobId, jobId));
+      progress = buildProgress({
+        totalImages,
+        processedImages: 0,
+        submittedImages: 0,
+        totalBatches: 0,
+        batchesCompleted: 0,
+      });
 
-  const cropsMeta: CropMeta[] = JSON.parse(
-    fsSync.readFileSync(cropsMetaPath, "utf8")
-  ) as CropMeta[];
+      await persistProgress(jobId, progress, {
+        rawZipPath: streamingResult.rawZipKey,
+        rawZipSizeBytes: streamingResult.rawZipSizeBytes,
+        thumbnailKey: streamingResult.thumbnailKey,
+        step: JobStep.BATCH_SUBMITTED,
+        status: JobsStatus.PROCESSING,
+        batchId: null,
+        batchInputFileId: null,
+        batchOutputFileId: null,
+      });
+
+      const cropsMeta: CropMeta[] = JSON.parse(
+        fsSync.readFileSync(cropsMetaPath, "utf8")
+      ) as CropMeta[];
       if (!cropsMeta.length) {
         throw new Error("No crops were generated from the provided ZIP file.");
       }
@@ -736,6 +785,9 @@ export const processOcrJob = inngest.createFunction(
         const cropsChunks = chunkArray(cropsMeta, BATCH_SIZE);
         const processedBatches: ProcessedBatchResult[] = [];
         const totalBatches = cropsChunks.length;
+
+        progress.totalBatches = totalBatches;
+        await persistProgress(jobId, progress);
 
         console.log(
           `Processing ${totalImages} images in ${totalBatches} batches of ${BATCH_SIZE} images each for job ${jobId}`
@@ -768,6 +820,9 @@ export const processOcrJob = inngest.createFunction(
               `Batch ID missing after creation for batch ${batchIndex}.`
             );
           }
+
+          progress.submittedImages += chunk.length;
+          await persistProgress(jobId, progress);
 
           console.log(
             `Waiting for batch ${batchIndex + 1}/${totalBatches} (batchId: ${artifacts.batchId}) to complete for job ${jobId}`
@@ -820,6 +875,10 @@ export const processOcrJob = inngest.createFunction(
             );
           }
 
+          progress.batchesCompleted += 1;
+          progress.processedImages += chunk.length;
+          await persistProgress(jobId, progress);
+
           console.log(
             `Batch ${batchIndex + 1}/${totalBatches} completed for job ${jobId}`
           );
@@ -863,6 +922,10 @@ export const processOcrJob = inngest.createFunction(
             openai,
           })
         );
+
+        progress.processedImages = totalImages;
+        progress.batchesCompleted = totalBatches;
+        await persistProgress(jobId, progress, { step: JobStep.RESULTS_SAVED });
 
         currentStep = JobStep.DOCS_BUILT;
       }
