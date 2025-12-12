@@ -53,13 +53,15 @@ import {
 } from "@/utils/storage";
 
 const BATCH_SLEEP_INTERVAL = "20s";
-const BATCH_SIZE = 1000;
+const BATCH_SIZE = 5000;
 
 type CropMeta = {
   filename: string;
   cropKey: string;
   cropSignedUrl: string;
 };
+
+type CropMetaMap = Record<string, string>;
 
 type WorkspacePaths = {
   jobRootDir: string;
@@ -115,12 +117,14 @@ const streamAndProcessZip = async ({
   storageKeys,
   cropsMetaPath,
   onTotalImages,
+  onPreprocessProgress,
 }: {
   jobId: string;
   zipKey: string;
   storageKeys: StorageKeys;
   cropsMetaPath: string;
   onTotalImages?: (count: number) => Promise<void>;
+  onPreprocessProgress?: (count: number) => Promise<void>;
 }): Promise<StreamingArtifacts> => {
   const zipReadable = await downloadObjectStream(zipKey);
   const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
@@ -211,6 +215,9 @@ const streamAndProcessZip = async ({
     }
 
     processedImages += 1;
+    if (onPreprocessProgress && processedImages % 50 === 0) {
+      await onPreprocessProgress(processedImages);
+    }
     if (onTotalImages && processedImages % 50 === 0) {
       await onTotalImages(processedImages);
     }
@@ -231,6 +238,9 @@ const streamAndProcessZip = async ({
 
   if (onTotalImages) {
     await onTotalImages(processedImages);
+  }
+  if (onPreprocessProgress) {
+    await onPreprocessProgress(processedImages);
   }
 
   return {
@@ -359,14 +369,26 @@ const saveBatchResults = async ({
   processedBatches,
   totalImages,
   openai,
+  cropUrlMap,
 }: {
   jobId: string;
   processedBatches: ProcessedBatchResult[];
   totalImages: number;
   openai: OpenAI;
+  cropUrlMap: CropMetaMap;
 }) => {
   const framesToPersist: PersistableFrame[] = [];
   let totalProcessedLines = 0;
+  const failedItems: Array<{ customId: string; filename: string }> = [];
+
+  const parseCustomId = (customId: string) => {
+    const match = customId.match(/^job-(.+)-batch-(\d+)-frame-(\d+)-(.+)$/);
+    if (!match) return null;
+    const index = Number.parseInt(match[3], 10);
+    if (Number.isNaN(index)) return null;
+    const filename = match[4];
+    return { filename, index };
+  };
 
   // Process each batch output file
   for (const { batchOutputFileId, batchIndex } of processedBatches) {
@@ -417,13 +439,16 @@ const saveBatchResults = async ({
       }
 
       if (parsed.error) {
-        const message =
-          parsed.error?.message ??
-          parsed.error?.code ??
-          "Unknown OpenAI batch error";
-        throw new Error(
-          `OpenAI batch ${batchIndex} entry failed (${parsed.custom_id ?? "unknown"}): ${message}`
-        );
+        if (parsed.custom_id) {
+          const parsedId = parseCustomId(parsed.custom_id);
+          if (parsedId) {
+            failedItems.push({
+              customId: parsed.custom_id,
+              filename: parsedId.filename,
+            });
+          }
+        }
+        continue;
       }
 
       const customId = parsed.custom_id;
@@ -432,16 +457,12 @@ const saveBatchResults = async ({
       }
 
       // Updated regex to match new custom_id format: job-{jobId}-batch-{batchIndex}-frame-{globalIndex}-{filename}
-      const match = customId.match(/^job-(.+)-batch-(\d+)-frame-(\d+)-(.+)$/);
-      if (!match) {
+      const parsedId = parseCustomId(customId);
+      if (!parsedId) {
         continue;
       }
 
-      const [, , , indexAsString, filename] = match;
-      const index = Number.parseInt(indexAsString, 10);
-      if (Number.isNaN(index)) {
-        continue;
-      }
+      const { filename, index } = parsedId;
 
       const completion =
         parsed.response?.body?.choices?.[0]?.message?.content;
@@ -456,6 +477,147 @@ const saveBatchResults = async ({
         filename,
         baseKey: getBaseKeyFromFilename(filename),
         index,
+        text,
+      });
+
+      totalProcessedLines += 1;
+    }
+  }
+
+  // Retry failed items once, building a new mini batch
+  if (failedItems.length) {
+    const retryJsonlPath = getJobBatchJsonlPath(jobId, processedBatches.length) + "-retry";
+    const jsonlStream = fsSync.createWriteStream(retryJsonlPath, {
+      encoding: "utf8",
+    });
+
+    for (const item of failedItems) {
+      const imageUrl = cropUrlMap[item.filename];
+      if (!imageUrl) {
+        continue;
+      }
+      const line = {
+        custom_id: item.customId,
+        method: "POST",
+        url: "/v1/chat/completions",
+        body: {
+          model: AI_CONSTANTS.MODELS.OPENAI,
+          temperature: 0,
+          max_tokens: 32,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: AI_CONSTANTS.PROMPTS.OCR },
+                {
+                  type: "image_url",
+                  image_url: { url: imageUrl },
+                },
+              ],
+            },
+          ],
+        },
+      };
+      jsonlStream.write(JSON.stringify(line) + "\n");
+    }
+
+    jsonlStream.end();
+    await new Promise<void>((resolve, reject) => {
+      jsonlStream.on("finish", () => resolve());
+      jsonlStream.on("error", (err) => reject(err));
+    });
+
+    const inputFile = await openai.files.create({
+      file: fsSync.createReadStream(retryJsonlPath),
+      purpose: "batch",
+    });
+
+    const batch = await openai.batches.create({
+      input_file_id: inputFile.id,
+      endpoint: "/v1/chat/completions",
+      completion_window: "24h",
+    });
+
+    // Poll simple
+    const waitSimple = async (): Promise<string> => {
+      for (let attempt = 0; attempt < 120; attempt++) {
+        const latest = await openai.batches.retrieve(batch.id);
+        if (latest.status === "completed" && latest.output_file_id) {
+          return latest.output_file_id as string;
+        }
+        if (latest.status === "failed" || latest.status === "cancelled") {
+          throw new Error(`Retry batch failed with status=${latest.status}`);
+        }
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+      throw new Error("Retry batch did not complete in time");
+    };
+
+    const retryOutputFileId = await waitSimple();
+
+    // Parse retry output
+    const outputStream = await openai.files.content(retryOutputFileId);
+    const outputBuffer = Buffer.from(await outputStream.arrayBuffer());
+    const outputJsonl = outputBuffer.toString("utf8");
+    const lines = outputJsonl
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    for (const line of lines) {
+      let parsed: {
+        custom_id?: string;
+        error?: { message?: string; code?: string };
+        response?: {
+          body?: {
+            choices?: Array<{
+              message?: { content?: ChatCompletionContent };
+            }>;
+          };
+        };
+      };
+      try {
+        parsed = JSON.parse(line) as {
+          custom_id?: string;
+          error?: { message?: string; code?: string };
+          response?: {
+            body?: {
+              choices?: Array<{
+                message?: { content?: ChatCompletionContent };
+              }>;
+            };
+          };
+        };
+      } catch (error) {
+        continue;
+      }
+
+      if (parsed.error) {
+        continue;
+      }
+
+      const customId = parsed.custom_id;
+      if (!customId) {
+        continue;
+      }
+      const parsedId = parseCustomId(customId);
+      if (!parsedId) {
+        continue;
+      }
+
+      const completion =
+        parsed.response?.body?.choices?.[0]?.message?.content;
+      const text = extractTextFromCompletion(completion);
+
+      if (!text || text === "<EMPTY>") {
+        continue;
+      }
+
+      framesToPersist.push({
+        jobId,
+        filename: parsedId.filename,
+        baseKey: getBaseKeyFromFilename(parsedId.filename),
+        index: parsedId.index,
         text,
       });
 
@@ -626,7 +788,7 @@ const ensureWorkspaceLayout = async (paths: WorkspacePaths) => {
 
 type ProgressState = {
   totalImages: number;
-  processedImages: number; // completadas por OpenAI
+  processedImages: number; // completadas en preprocesado (crops/resize)
   submittedImages: number; // enviadas a OpenAI
   totalBatches: number;
   batchesCompleted: number;
@@ -770,6 +932,13 @@ export const processOcrJob = inngest.createFunction(
             zipKey: storageZipKey,
             storageKeys,
             cropsMetaPath,
+            onPreprocessProgress: async (count) => {
+              progress.processedImages = count; // progreso de preprocesado
+              await persistProgress(jobId, progress, {
+                step: JobStep.PREPROCESSING,
+                status: JobsStatus.PROCESSING,
+              });
+            },
             onTotalImages: async (count) => {
               // Solo actualizamos el total de imágenes detectadas en el ZIP
               progress.totalImages = count;
@@ -786,7 +955,7 @@ export const processOcrJob = inngest.createFunction(
 
       progress = buildProgress({
         totalImages,
-        processedImages: 0,
+        processedImages: totalImages, // avance de preprocesado
         submittedImages: 0,
         totalBatches: 0,
         batchesCompleted: 0,
@@ -821,6 +990,9 @@ export const processOcrJob = inngest.createFunction(
       if (!cropsMeta.length) {
         throw new Error("No crops were generated from the provided ZIP file.");
       }
+      const cropUrlMap: CropMetaMap = Object.fromEntries(
+        cropsMeta.map((c) => [c.filename, c.cropSignedUrl])
+      );
       currentStep = JobStep.BATCH_SUBMITTED;
 
       if (currentStep === JobStep.BATCH_SUBMITTED) {
@@ -919,7 +1091,6 @@ export const processOcrJob = inngest.createFunction(
           }
 
           progress.batchesCompleted += 1;
-          progress.processedImages += chunk.length;
           await persistProgress(jobId, progress);
 
           console.log(
@@ -963,6 +1134,7 @@ export const processOcrJob = inngest.createFunction(
             processedBatches,
             totalImages,
             openai,
+            cropUrlMap,
           })
         );
 
