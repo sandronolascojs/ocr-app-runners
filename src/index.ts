@@ -1,12 +1,8 @@
 import { serve } from 'inngest/fastify';
 import Fastify from 'fastify';
 import { inngest } from './inngest/client';
-import { preprocessZip } from './inngest/functions/preprocessZip';
-import { createBatch } from './inngest/functions/createBatch';
-import { waitForBatch } from './inngest/functions/waitForBatch';
-import { processAllBatches } from './inngest/functions/processAllBatches';
-import { buildDocuments } from './inngest/functions/buildDocuments';
 import { env } from './config/env.config';
+import { processOcrJob } from './inngest/functions/processOcrJob';
 
 const fastify = Fastify({
   logger: true,
@@ -20,11 +16,7 @@ fastify.route({
   handler: serve({
     client: inngest,
     functions: [
-      preprocessZip,
-      createBatch,
-      waitForBatch,
-      processAllBatches,
-      buildDocuments,
+      processOcrJob
     ],
   }),
   url: '/api/inngest',
