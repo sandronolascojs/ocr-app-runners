@@ -53,7 +53,7 @@ import {
 } from "@/utils/storage";
 
 const BATCH_SLEEP_INTERVAL = "20s";
-const BATCH_SIZE = 5000;
+const BATCH_SIZE = 1000;
 
 type CropMeta = {
   filename: string;
@@ -116,14 +116,12 @@ const streamAndProcessZip = async ({
   zipKey,
   storageKeys,
   cropsMetaPath,
-  onTotalImages,
   onPreprocessProgress,
 }: {
   jobId: string;
   zipKey: string;
   storageKeys: StorageKeys;
   cropsMetaPath: string;
-  onTotalImages?: (count: number) => Promise<void>;
   onPreprocessProgress?: (count: number) => Promise<void>;
 }): Promise<StreamingArtifacts> => {
   const zipReadable = await downloadObjectStream(zipKey);
@@ -218,8 +216,8 @@ const streamAndProcessZip = async ({
     if (onPreprocessProgress && processedImages % 50 === 0) {
       await onPreprocessProgress(processedImages);
     }
-    if (onTotalImages && processedImages % 50 === 0) {
-      await onTotalImages(processedImages);
+    if (onPreprocessProgress && processedImages % 50 === 0) {
+      await onPreprocessProgress(processedImages);
     }
   }
 
@@ -236,9 +234,6 @@ const streamAndProcessZip = async ({
 
   await fs.writeFile(cropsMetaPath, JSON.stringify(sortedCrops), "utf8");
 
-  if (onTotalImages) {
-    await onTotalImages(processedImages);
-  }
   if (onPreprocessProgress) {
     await onPreprocessProgress(processedImages);
   }
@@ -261,6 +256,26 @@ const chunkArray = <T>(array: T[], chunkSize: number): T[][] => {
     chunks.push(array.slice(i, i + chunkSize));
   }
   return chunks;
+};
+
+// Solo cuenta cuántas imágenes procesables hay en el ZIP (sin descargar contenido)
+const countProcessableImagesInZip = async (zipKey: string): Promise<number> => {
+  const zipReadable = await downloadObjectStream(zipKey);
+  const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
+  let total = 0;
+  for await (const entry of unzipStream) {
+    if (entry.type === "Directory") {
+      entry.autodrain();
+      continue;
+    }
+    const entryName = entry.path;
+    const processable = validateProcessableImageEntry(entryName);
+    if (processable) {
+      total += 1;
+    }
+    entry.autodrain();
+  }
+  return total;
 };
 
 const createBatchArtifacts = async ({
@@ -376,7 +391,7 @@ const saveBatchResults = async ({
   totalImages: number;
   openai: OpenAI;
   cropUrlMap: CropMetaMap;
-}) => {
+}): Promise<number> => {
   const framesToPersist: PersistableFrame[] = [];
   let totalProcessedLines = 0;
   const failedItems: Array<{ customId: string; filename: string }> = [];
@@ -642,8 +657,10 @@ const saveBatchResults = async ({
 
   await db
     .update(ocrJobs)
-    .set({ step: JobStep.DOCS_BUILT, processedImages: totalProcessedLines })
+    .set({ step: JobStep.DOCS_BUILT })
     .where(eq(ocrJobs.jobId, jobId));
+
+  return totalProcessedLines;
 };
 
 const buildDocuments = async ({
@@ -919,11 +936,26 @@ export const processOcrJob = inngest.createFunction(
 
       await ensureWorkspaceLayout(workspacePaths);
 
+      // Paso 1: contar imágenes procesables antes de procesar
+      const countedImages = await step.run("count-images", () =>
+        countProcessableImagesInZip(storageZipKey)
+      );
+      totalImages = countedImages;
+
+      progress = buildProgress({
+        totalImages,
+        processedImages: 0, // OCR completadas
+        submittedImages: 0,
+        totalBatches: 0,
+        batchesCompleted: 0,
+      });
+
       await persistProgress(jobId, progress, {
         step: JobStep.PREPROCESSING,
         status: JobsStatus.PROCESSING,
       });
 
+      // Paso 2: preprocesar (crops, resize, zip filtrado)
       const streamingResult = await step.run(
         OcrStepId.PreprocessImagesAndCrops,
         () =>
@@ -933,15 +965,8 @@ export const processOcrJob = inngest.createFunction(
             storageKeys,
             cropsMetaPath,
             onPreprocessProgress: async (count) => {
-              progress.processedImages = count; // progreso de preprocesado
-              await persistProgress(jobId, progress, {
-                step: JobStep.PREPROCESSING,
-                status: JobsStatus.PROCESSING,
-              });
-            },
-            onTotalImages: async (count) => {
-              // Solo actualizamos el total de imágenes detectadas en el ZIP
-              progress.totalImages = count;
+              // processedImages refleja avance de preprocesado (crops/resize)
+              progress.processedImages = count;
               await persistProgress(jobId, progress, {
                 step: JobStep.PREPROCESSING,
                 status: JobsStatus.PROCESSING,
@@ -955,7 +980,7 @@ export const processOcrJob = inngest.createFunction(
 
       progress = buildProgress({
         totalImages,
-        processedImages: totalImages, // avance de preprocesado
+        processedImages: totalImages, // ya terminó preprocesado
         submittedImages: 0,
         totalBatches: 0,
         batchesCompleted: 0,
@@ -1127,7 +1152,7 @@ export const processOcrJob = inngest.createFunction(
 
         currentStep = JobStep.RESULTS_SAVED;
 
-        // Save all batch results
+        // Save all batch results (processedImages se queda para preprocesado)
         await step.run(OcrStepId.SaveResultsToDb, () =>
           saveBatchResults({
             jobId,
@@ -1138,7 +1163,6 @@ export const processOcrJob = inngest.createFunction(
           })
         );
 
-        progress.processedImages = totalImages;
         progress.batchesCompleted = totalBatches;
         await persistProgress(jobId, progress, { step: JobStep.RESULTS_SAVED });
 
