@@ -62,6 +62,12 @@ type CropMeta = {
 };
 
 type CropMetaMap = Record<string, string>;
+type ExpectedEntry = {
+  customId: string;
+  filename: string;
+  index: number;
+  url: string;
+};
 
 type WorkspacePaths = {
   jobRootDir: string;
@@ -321,7 +327,7 @@ const createBatchArtifacts = async ({
       body: {
         model: AI_CONSTANTS.MODELS.OPENAI,
         temperature: 0,
-        max_tokens: 32,
+        max_tokens: 1024,
         messages: [
           {
             role: "user",
@@ -385,16 +391,26 @@ const saveBatchResults = async ({
   totalImages,
   openai,
   cropUrlMap,
+  cropsMeta,
 }: {
   jobId: string;
   processedBatches: ProcessedBatchResult[];
   totalImages: number;
   openai: OpenAI;
   cropUrlMap: CropMetaMap;
+  cropsMeta: CropMeta[];
 }): Promise<number> => {
   const framesToPersist: PersistableFrame[] = [];
   let totalProcessedLines = 0;
   const failedItems: Array<{ customId: string; filename: string }> = [];
+  const expectedEntries: ExpectedEntry[] = cropsMeta.map((c, idx) => ({
+    customId: `job-${jobId}-batch-${Math.floor(idx / BATCH_SIZE)}-frame-${idx}-${c.filename}`,
+    filename: c.filename,
+    index: idx,
+    url: c.cropSignedUrl,
+  }));
+  const expectedMap = new Map(expectedEntries.map((e) => [e.customId, e]));
+  const seen = new Set<string>();
 
   const parseCustomId = (customId: string) => {
     const match = customId.match(/^job-(.+)-batch-(\d+)-frame-(\d+)-(.+)$/);
@@ -478,6 +494,7 @@ const saveBatchResults = async ({
       }
 
       const { filename, index } = parsedId;
+      seen.add(customId);
 
       const completion =
         parsed.response?.body?.choices?.[0]?.message?.content;
@@ -499,15 +516,36 @@ const saveBatchResults = async ({
     }
   }
 
-  // Retry failed items once, building a new mini batch
-  if (failedItems.length) {
+  // Determinar faltantes no vistos
+  const missingItems: Array<{ customId: string; filename: string; index: number }> = [];
+  for (const [customId, entry] of expectedMap.entries()) {
+    if (!seen.has(customId)) {
+      missingItems.push({
+        customId,
+        filename: entry.filename,
+        index: entry.index,
+      });
+    }
+  }
+
+  // Retry failed + missing items una vez, en un mini batch
+  const retryItems = [
+    ...failedItems.map((f) => ({ ...f, index: expectedMap.get(f.customId)?.index ?? 0 })),
+    ...missingItems,
+  ];
+
+  if (retryItems.length) {
     const retryJsonlPath = getJobBatchJsonlPath(jobId, processedBatches.length) + "-retry";
     const jsonlStream = fsSync.createWriteStream(retryJsonlPath, {
       encoding: "utf8",
     });
 
-    for (const item of failedItems) {
-      const imageUrl = cropUrlMap[item.filename];
+    const seenRetry = new Set<string>();
+    for (const item of retryItems) {
+      if (seenRetry.has(item.customId)) continue;
+      seenRetry.add(item.customId);
+
+      const imageUrl = cropUrlMap[item.filename] || expectedMap.get(item.customId)?.url;
       if (!imageUrl) {
         continue;
       }
@@ -1160,6 +1198,7 @@ export const processOcrJob = inngest.createFunction(
             totalImages,
             openai,
             cropUrlMap,
+            cropsMeta,
           })
         );
 
