@@ -477,6 +477,17 @@ const saveBatchResults = async ({
               customId: parsed.custom_id,
               filename: parsedId.filename,
             });
+            
+            // Include failed items in count with empty text - retry will attempt to get real text
+            framesToPersist.push({
+              jobId,
+              filename: parsedId.filename,
+              baseKey: getBaseKeyFromFilename(parsedId.filename),
+              index: parsedId.index,
+              text: "",
+            });
+            seen.add(parsed.custom_id);
+            totalProcessedLines += 1;
           }
         }
         continue;
@@ -500,16 +511,16 @@ const saveBatchResults = async ({
         parsed.response?.body?.choices?.[0]?.message?.content;
       const text = extractTextFromCompletion(completion);
 
-      if (!text || text === "<EMPTY>") {
-        continue;
-      }
+      // Include ALL responses, even if empty - don't skip any frames
+      // Convert <EMPTY> or empty strings to empty string to ensure all frames are included
+      const finalText = (!text || text === "<EMPTY>") ? "" : text;
 
       framesToPersist.push({
         jobId,
         filename,
         baseKey: getBaseKeyFromFilename(filename),
         index,
-        text,
+        text: finalText,
       });
 
       totalProcessedLines += 1;
@@ -556,7 +567,7 @@ const saveBatchResults = async ({
         body: {
           model: AI_CONSTANTS.MODELS.OPENAI,
           temperature: 0,
-          max_tokens: 32,
+          max_tokens: 1024,
           messages: [
             {
               role: "user",
@@ -662,19 +673,29 @@ const saveBatchResults = async ({
         parsed.response?.body?.choices?.[0]?.message?.content;
       const text = extractTextFromCompletion(completion);
 
-      if (!text || text === "<EMPTY>") {
-        continue;
+      // Include ALL responses, even if empty - don't skip any frames
+      // Convert <EMPTY> or empty strings to empty string to ensure all frames are included
+      const finalText = (!text || text === "<EMPTY>") ? "" : text;
+
+      // Update existing frame if it exists (from failed items), otherwise add new one
+      const existingFrameIndex = framesToPersist.findIndex(
+        (f) => f.index === parsedId.index && f.filename === parsedId.filename
+      );
+      
+      if (existingFrameIndex >= 0) {
+        // Update existing frame with retry result
+        framesToPersist[existingFrameIndex].text = finalText;
+      } else {
+        // Add new frame if it doesn't exist
+        framesToPersist.push({
+          jobId,
+          filename: parsedId.filename,
+          baseKey: getBaseKeyFromFilename(parsedId.filename),
+          index: parsedId.index,
+          text: finalText,
+        });
+        totalProcessedLines += 1;
       }
-
-      framesToPersist.push({
-        jobId,
-        filename: parsedId.filename,
-        baseKey: getBaseKeyFromFilename(parsedId.filename),
-        index: parsedId.index,
-        text,
-      });
-
-      totalProcessedLines += 1;
     }
   }
 
