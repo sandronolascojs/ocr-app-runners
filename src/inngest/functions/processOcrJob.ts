@@ -6,8 +6,8 @@ import { Transform } from "node:stream";
 import unzipper from "unzipper";
 import { inngest } from "@/inngest/client";
 import { db } from "@/db";
-import { ocrJobs, ocrJobFrames } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { ocrJobs, ocrJobFrames, ocrJobItems } from "@/db/schema";
+import { eq, and } from "drizzle-orm";
 import {
   validateProcessableImageEntry,
   getBaseKeyFromFilename,
@@ -34,6 +34,8 @@ import { writeDocxFromParagraphs } from "@/utils/ocr/docx";
 import { buildParagraphsFromFrames } from "@/utils/ocr/paragraphs";
 import { JobsStatus } from "@/types";
 import { JobStep } from "@/types/enums/jobs/jobStep.enum";
+import { JobItemType } from "@/types/enums/jobs/jobItemType.enum";
+import { JobType } from "@/types/enums/jobs/jobType.enum";
 import { InngestEvents, OcrStepId, OcrSleepId } from "@/types/enums/inngest";
 import { getUserOpenAIClient } from "@/utils/openai-user";
 import type { OpenAI } from "openai";
@@ -118,13 +120,95 @@ type PersistableFrame = {
 
 const CROP_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24; // 24 hours
 
+/**
+ * Helper function to get a job item by type
+ */
+const getJobItemByType = async (
+  jobId: string,
+  itemType: JobItemType
+): Promise<string | null> => {
+  const [item] = await db
+    .select()
+    .from(ocrJobItems)
+    .where(
+      and(
+        eq(ocrJobItems.jobId, jobId),
+        eq(ocrJobItems.itemType, itemType)
+      )
+    )
+    .limit(1);
+  
+  return item?.storageKey ?? null;
+};
+
+/**
+ * Helper function to create or update a job item in the database
+ */
+const createJobItem = async ({
+  jobId,
+  itemType,
+  storageKey,
+  sizeBytes,
+  contentType,
+  parentItemId,
+}: {
+  jobId: string;
+  itemType: JobItemType;
+  storageKey: string;
+  sizeBytes?: number;
+  contentType?: string;
+  parentItemId?: string;
+}): Promise<string> => {
+  // Check if item already exists
+  const existing = await db
+    .select()
+    .from(ocrJobItems)
+    .where(
+      and(
+        eq(ocrJobItems.jobId, jobId),
+        eq(ocrJobItems.itemType, itemType)
+      )
+    )
+    .limit(1);
+
+  if (existing.length > 0) {
+    // Update existing item
+    await db
+      .update(ocrJobItems)
+      .set({
+        storageKey,
+        sizeBytes: sizeBytes ?? null,
+        contentType: contentType ?? null,
+        parentItemId: parentItemId ?? null,
+      })
+      .where(eq(ocrJobItems.ocrJobItemId, existing[0].ocrJobItemId));
+    return existing[0].ocrJobItemId;
+  } else {
+    // Create new item
+    const [newItem] = await db
+      .insert(ocrJobItems)
+      .values({
+        jobId,
+        itemType,
+        storageKey,
+        sizeBytes: sizeBytes ?? null,
+        contentType: contentType ?? null,
+        parentItemId: parentItemId ?? null,
+      })
+      .returning({ ocrJobItemId: ocrJobItems.ocrJobItemId });
+    return newItem.ocrJobItemId;
+  }
+};
+
 const streamAndProcessZip = async ({
+  userId,
   jobId,
   zipKey,
   storageKeys,
   cropsMetaPath,
   onPreprocessProgress,
 }: {
+  userId: string;
   jobId: string;
   zipKey: string;
   storageKeys: StorageKeys;
@@ -187,7 +271,7 @@ const streamAndProcessZip = async ({
       /\.(png|jpe?g)$/i,
       ".png"
     );
-    const cropKey = getJobCropKey(jobId, cropFilename);
+    const cropKey = getJobCropKey(userId, jobId, cropFilename);
     await uploadBufferToObject({
       key: cropKey,
       body: cropBuffer,
@@ -209,7 +293,7 @@ const streamAndProcessZip = async ({
 
     if (!thumbnailKey) {
       const thumbnailBuffer = await createThumbnailFromBuffer(normalizedBuffer);
-      const thumbKey = getJobThumbnailKey(jobId);
+      const thumbKey = getJobThumbnailKey(userId, jobId);
       await uploadBufferToObject({
         key: thumbKey,
         body: thumbnailBuffer,
@@ -770,7 +854,7 @@ const buildDocuments = async ({
   paths: WorkspacePaths;
   storageKeys: StorageKeys;
   totalImages: number;
-}): Promise<string | null> => {
+}): Promise<void> => {
   const frames = await db
     .select()
     .from(ocrJobFrames)
@@ -807,15 +891,29 @@ const buildDocuments = async ({
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   });
 
-  // Update job with documents info
+  // Create items for documents
+  await createJobItem({
+    jobId,
+    itemType: JobItemType.TXT_DOCUMENT,
+    storageKey: storageKeys.txtKey,
+    sizeBytes: txtStats.size,
+    contentType: "text/plain; charset=utf-8",
+  });
+
+  await createJobItem({
+    jobId,
+    itemType: JobItemType.DOCX_DOCUMENT,
+    storageKey: storageKeys.docxKey,
+    sizeBytes: docxStats.size,
+    contentType:
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
+
+  // Update job status
   await db
     .update(ocrJobs)
     .set({
       status: JobsStatus.DONE,
-      txtPath: storageKeys.txtKey,
-      docxPath: storageKeys.docxKey,
-      txtSizeBytes: txtStats.size,
-      docxSizeBytes: docxStats.size,
     })
     .where(eq(ocrJobs.jobId, jobId));
 
@@ -868,8 +966,7 @@ const buildDocuments = async ({
     }
   }
 
-  // Return raw zip key (already saved in DB earlier, use storage key)
-  return storageKeys.rawZipKey;
+  // Documents are now saved as items, no need to return anything
 };
 
 const buildWorkspacePaths = (jobId: string): WorkspacePaths => ({
@@ -884,10 +981,10 @@ const buildWorkspacePaths = (jobId: string): WorkspacePaths => ({
   rawArchivePath: getJobRawArchivePath(jobId),
 });
 
-const buildStorageKeys = (jobId: string): StorageKeys => ({
-  txtKey: getJobTxtKey(jobId),
-  docxKey: getJobDocxKey(jobId),
-  rawZipKey: getJobRawArchiveKey(jobId),
+const buildStorageKeys = (userId: string, jobId: string): StorageKeys => ({
+  txtKey: getJobTxtKey(userId, jobId),
+  docxKey: getJobDocxKey(userId, jobId),
+  rawZipKey: getJobRawArchiveKey(userId, jobId),
 });
 
 const ensureWorkspaceLayout = async (paths: WorkspacePaths) => {
@@ -922,6 +1019,19 @@ const persistProgress = async (
   progress: ProgressState,
   extra?: Record<string, unknown>
 ) => {
+  // Filter out legacy fields that no longer exist in schema
+  const allowedFields = [
+    'step',
+    'status',
+    'error',
+  ];
+  
+  const filteredExtra = extra
+    ? Object.fromEntries(
+        Object.entries(extra).filter(([key]) => allowedFields.includes(key))
+      )
+    : {};
+
   await db
     .update(ocrJobs)
     .set({
@@ -930,7 +1040,7 @@ const persistProgress = async (
       totalBatches: progress.totalBatches,
       batchesCompleted: progress.batchesCompleted,
       submittedImages: progress.submittedImages,
-      ...extra,
+      ...filteredExtra,
     })
     .where(eq(ocrJobs.jobId, jobId));
 };
@@ -1002,10 +1112,41 @@ export const processOcrJob = inngest.createFunction(
         return { jobId, txtKey: "", docxKey: "", rawZipKey: null };
       }
 
-      const storageZipKey = zipKey ?? job.zipPath;
+      // Validate that this is an OCR job, not a subtitle removal job
+      if (job.jobType !== JobType.OCR) {
+        console.error(
+          `Job ${jobId} is not an OCR job. Job type: ${job.jobType}. This function only processes OCR jobs.`
+        );
+        return { jobId, txtKey: "", docxKey: "", rawZipKey: null };
+      }
+
+      // Get original zip key from items or use provided zipKey
+      const originalZipKey = await getJobItemByType(jobId, JobItemType.ORIGINAL_ZIP);
+      const storageZipKey = zipKey ?? originalZipKey;
       if (!storageZipKey) {
         console.error("Zip key missing for job", jobId);
         return { jobId, txtKey: "", docxKey: "", rawZipKey: null };
+      }
+
+      // Create item for original zip if it doesn't exist
+      const originalZipItem = await db
+        .select()
+        .from(ocrJobItems)
+        .where(
+          and(
+            eq(ocrJobItems.jobId, jobId),
+            eq(ocrJobItems.itemType, JobItemType.ORIGINAL_ZIP)
+          )
+        )
+        .limit(1);
+
+      if (originalZipItem.length === 0) {
+        await createJobItem({
+          jobId,
+          itemType: JobItemType.ORIGINAL_ZIP,
+          storageKey: storageZipKey,
+          contentType: "application/zip",
+        });
       }
 
       // Estado actual en memoria (se irá actualizando manualmente)
@@ -1013,22 +1154,23 @@ export const processOcrJob = inngest.createFunction(
       let totalImages = job.totalImages ?? 0;
 
       const workspacePaths = buildWorkspacePaths(jobId);
-      const storageKeys = buildStorageKeys(jobId);
+      const storageKeys = buildStorageKeys(userId, jobId);
       const cropsMetaPath = path.join(workspacePaths.cropsDir, "cropsMeta.json");
-      let rawZipKeyForJob: string | null = job.rawZipPath ?? null;
+      let rawZipKeyForJob: string | null = await getJobItemByType(jobId, JobItemType.RAW_ZIP);
 
       // If already completed, short-circuit (avoid reading missing temp files)
-      if (
-        (job.step === JobStep.DOCS_BUILT || job.step === JobStep.RESULTS_SAVED) &&
-        job.txtPath &&
-        job.docxPath
-      ) {
-        return {
-          jobId,
-          txtKey: job.txtPath,
-          docxKey: job.docxPath,
-          rawZipKey: rawZipKeyForJob,
-        };
+      if (job.step === JobStep.DOCS_BUILT || job.step === JobStep.RESULTS_SAVED) {
+        const txtKey = await getJobItemByType(jobId, JobItemType.TXT_DOCUMENT);
+        const docxKey = await getJobItemByType(jobId, JobItemType.DOCX_DOCUMENT);
+        
+        if (txtKey && docxKey) {
+          return {
+            jobId,
+            txtKey,
+            docxKey,
+            rawZipKey: rawZipKeyForJob,
+          };
+        }
       }
 
       await ensureWorkspaceLayout(workspacePaths);
@@ -1057,6 +1199,7 @@ export const processOcrJob = inngest.createFunction(
         OcrStepId.PreprocessImagesAndCrops,
         () =>
           streamAndProcessZip({
+            userId,
             jobId,
             zipKey: storageZipKey,
             storageKeys,
@@ -1084,24 +1227,42 @@ export const processOcrJob = inngest.createFunction(
       });
 
       await persistProgress(jobId, progress, {
-        rawZipPath: streamingResult.rawZipKey,
-        rawZipSizeBytes: streamingResult.rawZipSizeBytes,
-        thumbnailKey: streamingResult.thumbnailKey,
         step: JobStep.BATCH_SUBMITTED,
         status: JobsStatus.PROCESSING,
-        batchId: null,
-        batchInputFileId: null,
-        batchOutputFileId: null,
       });
+
+      // Create items for raw zip and thumbnail (thumbnail linked to raw zip)
+      let rawZipItemId: string | undefined;
+      if (streamingResult.rawZipKey) {
+        rawZipItemId = await createJobItem({
+          jobId,
+          itemType: JobItemType.RAW_ZIP,
+          storageKey: streamingResult.rawZipKey,
+          sizeBytes: streamingResult.rawZipSizeBytes ?? undefined,
+          contentType: "application/zip",
+        });
+      }
+
+      if (streamingResult.thumbnailKey && rawZipItemId) {
+        await createJobItem({
+          jobId,
+          itemType: JobItemType.THUMBNAIL,
+          storageKey: streamingResult.thumbnailKey,
+          contentType: "image/jpeg",
+          parentItemId: rawZipItemId,
+        });
+      }
 
       if (!fsSync.existsSync(cropsMetaPath)) {
         console.warn(
           `cropsMeta.json missing for job ${jobId}; assuming processing already completed or temp cleaned.`
         );
+        const txtKey = await getJobItemByType(jobId, JobItemType.TXT_DOCUMENT);
+        const docxKey = await getJobItemByType(jobId, JobItemType.DOCX_DOCUMENT);
         return {
           jobId,
-          txtKey: job.txtPath ?? "",
-          docxKey: job.docxPath ?? "",
+          txtKey: txtKey ?? "",
+          docxKey: docxKey ?? "",
           rawZipKey: rawZipKeyForJob,
         };
       }
@@ -1347,14 +1508,8 @@ export const processOcrJob = inngest.createFunction(
           batchIndex += 1;
 
           // Update job with the last batch info (for tracking purposes)
-          await db
-            .update(ocrJobs)
-            .set({
-              batchId: artifacts.batchId,
-              batchInputFileId: artifacts.batchInputFileId,
-              batchOutputFileId,
-            })
-            .where(eq(ocrJobs.jobId, jobId));
+          // Batch info is no longer stored in ocrJobs table
+          // It's tracked in processedBatches array
         }
 
         console.log(
@@ -1389,7 +1544,7 @@ export const processOcrJob = inngest.createFunction(
       }
 
       if (currentStep === JobStep.DOCS_BUILT) {
-        rawZipKeyForJob = await step.run(OcrStepId.BuildDocsAndCleanup, () =>
+        await step.run(OcrStepId.BuildDocsAndCleanup, () =>
           buildDocuments({
             jobId,
             paths: workspacePaths,
@@ -1408,11 +1563,16 @@ export const processOcrJob = inngest.createFunction(
           .where(eq(ocrJobs.jobId, jobId));
       }
 
+      // Get final keys from items
+      const finalTxtKey = await getJobItemByType(jobId, JobItemType.TXT_DOCUMENT);
+      const finalDocxKey = await getJobItemByType(jobId, JobItemType.DOCX_DOCUMENT);
+      const finalRawZipKey = await getJobItemByType(jobId, JobItemType.RAW_ZIP);
+
       return {
         jobId,
-        txtKey: storageKeys.txtKey,
-        docxKey: storageKeys.docxKey,
-        rawZipKey: rawZipKeyForJob,
+        txtKey: finalTxtKey ?? storageKeys.txtKey,
+        docxKey: finalDocxKey ?? storageKeys.docxKey,
+        rawZipKey: finalRawZipKey,
       };
     } catch (err) {
       console.error("processOcrJob failed", jobId, err);

@@ -61,6 +61,3 @@ docker-compose*.yml
 .gitlab-ci.yml
 .circleci
 
-# Scripts (not needed in production)
-scripts
-

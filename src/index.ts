@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import { inngest } from './inngest/client';
 import { env } from './config/env.config';
 import { processOcrJob } from './inngest/functions/processOcrJob';
+import { removeSubtitlesFromImages } from './inngest/functions/removeSubtitles';
 
 const fastify = Fastify({
   logger: true,
@@ -16,7 +17,8 @@ fastify.route({
   handler: serve({
     client: inngest,
     functions: [
-      processOcrJob
+      processOcrJob,
+      removeSubtitlesFromImages,
     ],
   }),
   url: '/api/inngest',

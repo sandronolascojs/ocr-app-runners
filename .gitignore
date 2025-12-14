@@ -11,7 +11,7 @@
 !.yarn/versions
 mnt
 db_data
-scripts
+scripts/delete-all-r2-files.ts
 
 # testing
 /coverage

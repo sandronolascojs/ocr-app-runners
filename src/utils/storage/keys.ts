@@ -1,31 +1,36 @@
-const STORAGE_PREFIXES = {
-  imagesBase: "image-files",
-  txtBase: "txt",
-  wordBase: "word",
-  tmpBase: "tmp",
-};
+export const getUserRootKey = (userId: string) => `users/${userId}`;
 
-export const getJobRootKey = (jobId: string) =>
-  `${STORAGE_PREFIXES.imagesBase}/${jobId}`;
+export const getJobRootKey = (userId: string, jobId: string) =>
+  `${getUserRootKey(userId)}/${jobId}`;
 
-export const getJobZipKey = (jobId: string) =>
-  `${getJobRootKey(jobId)}/input.zip`;
+export const getJobZipKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/input.zip`;
 
-export const getJobRawArchiveKey = (jobId: string) =>
-  `${getJobRootKey(jobId)}/raw-images.zip`;
+export const getJobRawArchiveKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/raw-images.zip`;
 
-export const getJobTxtKey = (jobId: string) =>
-  `${STORAGE_PREFIXES.txtBase}/${jobId}.txt`;
+export const getJobTxtKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/document.txt`;
 
-export const getJobDocxKey = (jobId: string) =>
-  `${STORAGE_PREFIXES.wordBase}/${jobId}.docx`;
+export const getJobDocxKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/document.docx`;
 
-export const getJobBatchJsonlKey = (jobId: string) =>
-  `${STORAGE_PREFIXES.tmpBase}/${jobId}-ocr-batch.jsonl`;
+export const getJobBatchJsonlKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/ocr-batch.jsonl`;
 
-export const getJobThumbnailKey = (jobId: string) =>
-  `${getJobRootKey(jobId)}/thumbnail.jpg`;
+export const getJobThumbnailKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/thumbnail.jpg`;
 
-export const getJobCropKey = (jobId: string, filename: string) =>
-  `${getJobRootKey(jobId)}/crops/${filename}`;
+export const getJobCropKey = (userId: string, jobId: string, filename: string) =>
+  `${getJobRootKey(userId, jobId)}/crops/${filename}`;
+
+export const getJobCroppedZipKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/cropped-images.zip`;
+
+export const getJobCroppedThumbnailKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/cropped-thumbnail.jpg`;
+
+// Helper to get normalized image key (used during processing)
+export const getJobNormalizedImageKey = (userId: string, jobId: string, filename: string) =>
+  `${getJobRootKey(userId, jobId)}/normalized/${filename}`;
 

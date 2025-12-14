@@ -207,6 +207,7 @@ export const createThumbnailFromBuffer = async (buffer: Buffer): Promise<Buffer>
     .toBuffer();
 };
 
+
 type FilenameToken = number | string;
 
 const tokenizeFilename = (input: string): FilenameToken[] => {

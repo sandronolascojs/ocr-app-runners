@@ -1,7 +1,8 @@
 import { bigint, integer, pgTable, text } from "drizzle-orm/pg-core";
-import { createdAt, createIdField, jobStatusEnum, jobStepEnum, updatedAt } from "./utils";
+import { createdAt, createIdField, jobStatusEnum, jobStepEnum, jobItemTypeEnum, jobTypeEnum, updatedAt } from "./utils";
 import { JobsStatus } from "@/types";
 import { JobStep } from "@/types/enums/jobs/jobStep.enum";
+import { JobType } from "@/types/enums/jobs/jobType.enum";
 
 export const ocrJobs = pgTable("ocr_jobs", {
   ocrJobId: createIdField({ name: "ocr_job_id" }),
@@ -10,22 +11,15 @@ export const ocrJobs = pgTable("ocr_jobs", {
 
   userId: text("user_id").notNull(),
 
+  jobType: jobTypeEnum("job_type").notNull().default(JobType.OCR),
+
+  parentJobId: text("parent_job_id"), // Reference to parent job (e.g., subtitle removal job -> OCR job)
+
   status: jobStatusEnum("status").notNull().default(JobsStatus.PENDING),
 
   step: jobStepEnum("step").notNull().default(JobStep.PREPROCESSING),
 
   error: text("error"),
-
-  zipPath: text("zip_path").notNull(),
-
-  txtPath: text("txt_path"),
-  docxPath: text("docx_path"),
-  rawZipPath: text("raw_zip_path"),
-
-  // Info del batch de OpenAI
-  batchId: text("batch_id"),
-  batchInputFileId: text("batch_input_file_id"),
-  batchOutputFileId: text("batch_output_file_id"),
 
   // Batch progress tracking
   totalBatches: integer("total_batches").notNull().default(0),
@@ -34,12 +28,6 @@ export const ocrJobs = pgTable("ocr_jobs", {
 
   totalImages: integer("total_images").notNull().default(0),
   processedImages: integer("processed_images").notNull().default(0),
-
-  // Storage tracking
-  txtSizeBytes: bigint("txt_size_bytes", { mode: "number" }),
-  docxSizeBytes: bigint("docx_size_bytes", { mode: "number" }),
-  rawZipSizeBytes: bigint("raw_zip_size_bytes", { mode: "number" }),
-  thumbnailKey: text("thumbnail_key"),
 
   createdAt,
   updatedAt,
@@ -72,3 +60,31 @@ export const ocrJobFrames = pgTable("ocr_job_frames", {
 export type InsertOcrJobFrame = typeof ocrJobFrames.$inferInsert;
 export type SelectOcrJobFrame = typeof ocrJobFrames.$inferSelect;
 export type UpdateOcrJobFrame = Partial<InsertOcrJobFrame>;
+
+// Job items - all files associated with a job (zips, documents, thumbnails)
+export const ocrJobItems = pgTable("ocr_job_items", {
+  ocrJobItemId: createIdField({ name: "ocr_job_item_id" }),
+
+  jobId: text("job_id")
+    .notNull()
+    .references(() => ocrJobs.jobId, {
+      onDelete: "cascade",
+    }),
+
+  itemType: jobItemTypeEnum("item_type").notNull(),
+
+  storageKey: text("storage_key").notNull(), // Key in storage (S3/R2)
+
+  sizeBytes: bigint("size_bytes", { mode: "number" }), // File size in bytes
+
+  contentType: text("content_type"), // MIME type
+
+  parentItemId: text("parent_item_id"), // Reference to parent item (e.g., thumbnail -> zip)
+
+  createdAt,
+  updatedAt,
+});
+
+export type InsertOcrJobItem = typeof ocrJobItems.$inferInsert;
+export type SelectOcrJobItem = typeof ocrJobItems.$inferSelect;
+export type UpdateOcrJobItem = Partial<InsertOcrJobItem>;

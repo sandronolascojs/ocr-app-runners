@@ -8,6 +8,27 @@
       "when": 1765554972688,
       "tag": "0000_ambiguous_lockheed",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1765610675019,
+      "tag": "0001_short_arclight",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1765649877688,
+      "tag": "0002_faulty_dazzler",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1765654145584,
+      "tag": "0003_smiling_doctor_faustus",
+      "breakpoints": true
     }
   ]
 }
