@@ -8,7 +8,6 @@ import { ocrJobs, ocrJobItems } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import {
   validateProcessableImageEntry,
-  normalizeBufferTo1280x720,
   createThumbnailFromBuffer,
 } from "@/utils/ocr";
 import { removeSubtitlesFromBuffer } from "@/utils/subtitles";
@@ -163,10 +162,9 @@ const streamAndRemoveSubtitles = async ({
     }
 
     const fileBuffer = await entry.buffer();
-    const normalizedBuffer = await normalizeBufferTo1280x720(fileBuffer);
-    
-    // Remove subtitles from the image
-    const imageWithoutSubtitles = await removeSubtitlesFromBuffer(normalizedBuffer);
+    // Remove subtitles from the original image buffer.
+    // Important: do not normalize with "fit: contain" here, as it can introduce black borders.
+    const imageWithoutSubtitles = await removeSubtitlesFromBuffer(fileBuffer);
 
     // Only include base images (1, 2, 3, etc.) in the final ZIP
     // Skip decimal variants (1.1, 1.2, etc.) from the ZIP
