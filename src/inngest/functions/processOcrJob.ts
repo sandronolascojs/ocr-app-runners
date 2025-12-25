@@ -3,7 +3,6 @@ import fsSync from "node:fs";
 import path from "node:path";
 import archiver from "archiver";
 import { Transform } from "node:stream";
-import unzipper from "unzipper";
 import { inngest } from "@/inngest/client";
 import { db } from "@/db";
 import { ocrJobs, ocrJobFrames, ocrJobItems } from "@/db/schema";
@@ -51,8 +50,11 @@ import {
   uploadBufferToObject,
   uploadStreamToObject,
   createSignedDownloadUrlWithTtl,
-  downloadObjectStream,
+  downloadObjectToTempFileVerified,
+  getObjectSize,
 } from "@/utils/storage";
+import { forEachZipEntry, readStreamToBuffer } from "@/utils/zip/zipFile";
+import { env } from "@/config/env.config";
 
 const BATCH_SLEEP_INTERVAL = "20s";
 const BATCH_SIZE = 500; // Reduced from 1000 to avoid token limit errors
@@ -119,6 +121,53 @@ type PersistableFrame = {
 };
 
 const CROP_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24; // 24 hours
+
+type JobItemMeta = {
+  storageKey: string;
+  sizeBytes: number | null;
+};
+
+const getJobItemMetaByType = async (
+  jobId: string,
+  itemType: JobItemType
+): Promise<JobItemMeta | null> => {
+  const [item] = await db
+    .select({
+      storageKey: ocrJobItems.storageKey,
+      sizeBytes: ocrJobItems.sizeBytes,
+    })
+    .from(ocrJobItems)
+    .where(and(eq(ocrJobItems.jobId, jobId), eq(ocrJobItems.itemType, itemType)))
+    .limit(1);
+
+  if (!item?.storageKey) return null;
+  return { storageKey: item.storageKey, sizeBytes: item.sizeBytes ?? null };
+};
+
+const assertR2ObjectMatchesExpectedSize = async (params: {
+  key: string;
+  expectedSizeBytes: number | null;
+  context: string;
+}): Promise<number> => {
+  const actualSizeBytes = await getObjectSize(params.key);
+  if (actualSizeBytes === null) {
+    throw new Error(
+      `R2 object not found for ${params.context}. key="${params.key}"`
+    );
+  }
+
+  if (
+    params.expectedSizeBytes !== null &&
+    actualSizeBytes !== params.expectedSizeBytes
+  ) {
+    throw new Error(
+      `R2 object size mismatch for ${params.context}. key="${params.key}", expectedSizeBytes=${params.expectedSizeBytes}, actualSizeBytes=${actualSizeBytes}. ` +
+        "This usually means the uploaded ZIP is truncated/corrupt (common after an incorrect multipart upload implementation)."
+    );
+  }
+
+  return actualSizeBytes;
+};
 
 /**
  * Helper function to get a job item by type
@@ -215,8 +264,11 @@ const streamAndProcessZip = async ({
   cropsMetaPath: string;
   onPreprocessProgress?: (count: number) => Promise<void>;
 }): Promise<StreamingArtifacts> => {
-  const zipReadable = await downloadObjectStream(zipKey);
-  const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
+  const { tempPath, release } = await downloadObjectToTempFileVerified({
+    key: zipKey,
+    prefix: `ocr-${jobId}`,
+  });
+  // Use yauzl instead of unzipper for large/ZIP64 robustness.
 
   const archive = archiver("zip", { zlib: { level: 9 } });
   let filteredZipSizeBytes = 0;
@@ -238,78 +290,92 @@ const streamAndProcessZip = async ({
   let processedImages = 0;
   let thumbnailKey: string | null = null;
 
-  for await (const entry of unzipStream) {
-    if (entry.type === "Directory") {
-      entry.autodrain();
-      continue;
-    }
+  try {
+    await forEachZipEntry({
+      filePath: tempPath,
+      onEntry: async (entry) => {
+        if (entry.isDirectory) return;
 
-    const entryName = entry.path;
-    const processable = validateProcessableImageEntry(entryName);
-    if (!processable) {
-      entry.autodrain();
-      continue;
-    }
+        const entryName = entry.fileName;
+        const processable = validateProcessableImageEntry(entryName);
+        if (!processable) return;
 
-    const fileBuffer = await entry.buffer();
-    const normalizedBuffer = await normalizeBufferTo1280x720(fileBuffer);
-    const cropBuffer = await cropSubtitleFromBuffer(normalizedBuffer);
+        const fileStream = await entry.openReadStream();
+        const fileBuffer = await readStreamToBuffer(fileStream);
+      const normalizedBuffer = await normalizeBufferTo1280x720(fileBuffer);
+      const cropBuffer = await cropSubtitleFromBuffer(normalizedBuffer);
 
-    // Only include base images (1, 2, 3, etc.) in the final ZIP
-    // Skip decimal variants (1.1, 1.2, etc.) from the ZIP
-    // Use original image (raw) with original extension
-    if (processable.shouldIncludeInZip) {
-      // Extract original extension from originalName (e.g., "1.jpg" -> ".jpg")
-      const originalExt = processable.originalName.match(/\.(png|jpe?g)$/i)?.[0] || '.png';
-      const zipFilename = `${processable.baseName}${originalExt}`;
-      archive.append(fileBuffer, { name: zipFilename });
-    }
+      // Only include base images (1, 2, 3, etc.) in the final ZIP
+      // Skip decimal variants (1.1, 1.2, etc.) from the ZIP
+      // Use original image (raw) with original extension
+      if (processable.shouldIncludeInZip) {
+        // Extract original extension from originalName (e.g., "1.jpg" -> ".jpg")
+        const originalExt =
+          processable.originalName.match(/\.(png|jpe?g)$/i)?.[0] || ".png";
+        const zipFilename = `${processable.baseName}${originalExt}`;
+        archive.append(fileBuffer, { name: zipFilename });
+      }
 
-    // Create crop for ALL images (including 1.1, 1.2, etc.) for OCR processing
-    // Use original filename to preserve the relationship
-    const cropFilename = processable.originalName.replace(
-      /\.(png|jpe?g)$/i,
-      ".png"
-    );
-    const cropKey = getJobCropKey(userId, jobId, cropFilename);
-    await uploadBufferToObject({
-      key: cropKey,
-      body: cropBuffer,
-      contentType: "image/png",
-    });
-
-    const signedCropUrl = await createSignedDownloadUrlWithTtl({
-      key: cropKey,
-      responseContentType: "image/png",
-      downloadFilename: cropFilename,
-      ttlSeconds: CROP_SIGNED_URL_TTL_SECONDS,
-    });
-
-    cropsMeta.push({
-      filename: cropFilename,
-      cropKey,
-      cropSignedUrl: signedCropUrl.url,
-    });
-
-    if (!thumbnailKey) {
-      const thumbnailBuffer = await createThumbnailFromBuffer(normalizedBuffer);
-      const thumbKey = getJobThumbnailKey(userId, jobId);
+      // Create crop for ALL images (including 1.1, 1.2, etc.) for OCR processing
+      // Use original filename to preserve the relationship
+      const cropFilename = processable.originalName.replace(
+        /\.(png|jpe?g)$/i,
+        ".png"
+      );
+      const cropKey = getJobCropKey(userId, jobId, cropFilename);
       await uploadBufferToObject({
-        key: thumbKey,
-        body: thumbnailBuffer,
-        contentType: "image/jpeg",
-        cacheControl: "public, max-age=31536000, immutable",
+        key: cropKey,
+        body: cropBuffer,
+        contentType: "image/png",
       });
-      thumbnailKey = thumbKey;
-    }
 
-    processedImages += 1;
-    if (onPreprocessProgress && processedImages % 50 === 0) {
-      await onPreprocessProgress(processedImages);
+      const signedCropUrl = await createSignedDownloadUrlWithTtl({
+        key: cropKey,
+        responseContentType: "image/png",
+        downloadFilename: cropFilename,
+        ttlSeconds: CROP_SIGNED_URL_TTL_SECONDS,
+      });
+
+      cropsMeta.push({
+        filename: cropFilename,
+        cropKey,
+        cropSignedUrl: signedCropUrl.url,
+      });
+
+      if (!thumbnailKey) {
+        const thumbnailBuffer = await createThumbnailFromBuffer(normalizedBuffer);
+        const thumbKey = getJobThumbnailKey(userId, jobId);
+        await uploadBufferToObject({
+          key: thumbKey,
+          body: thumbnailBuffer,
+          contentType: "image/jpeg",
+          cacheControl: "public, max-age=31536000, immutable",
+        });
+        thumbnailKey = thumbKey;
+      }
+
+      processedImages += 1;
+      if (onPreprocessProgress && processedImages % 50 === 0) {
+        await onPreprocessProgress(processedImages);
+      }
+      },
+    });
+  } catch (err) {
+    const sizeBytes = await getObjectSize(zipKey).catch(() => null);
+    throw new Error(
+      `Failed to stream ZIP entries from R2. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}. ` +
+        "This indicates the ZIP is truncated/corrupt. If the ZIP was uploaded via multipart, ensure each part PUT is raw bytes (not multipart/form-data) " +
+        "and that all parts are uploaded before completing the multipart upload.",
+      { cause: err }
+    );
+  } finally {
+    if (env.R2_SPOOL_KEEP_FILES_ON_ERROR) {
+      // Keep for inspection; do not delete.
+      console.warn(`[zip-spool] keeping temp zip for inspection: ${tempPath}`);
+    } else {
+      await fs.unlink(tempPath).catch(() => undefined);
     }
-    if (onPreprocessProgress && processedImages % 50 === 0) {
-      await onPreprocessProgress(processedImages);
-    }
+    release();
   }
 
   await archive.finalize();
@@ -351,20 +417,36 @@ const chunkArray = <T>(array: T[], chunkSize: number): T[][] => {
 
 // Solo cuenta cuántas imágenes procesables hay en el ZIP (sin descargar contenido)
 const countProcessableImagesInZip = async (zipKey: string): Promise<number> => {
-  const zipReadable = await downloadObjectStream(zipKey);
-  const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
+  const { tempPath, release } = await downloadObjectToTempFileVerified({
+    key: zipKey,
+    prefix: "count",
+  });
   let total = 0;
-  for await (const entry of unzipStream) {
-    if (entry.type === "Directory") {
-      entry.autodrain();
-      continue;
+  try {
+    await forEachZipEntry({
+      filePath: tempPath,
+      onEntry: async (entry) => {
+        if (entry.isDirectory) return;
+        const entryName = entry.fileName;
+        const processable = validateProcessableImageEntry(entryName);
+        if (processable) total += 1;
+      },
+    });
+  } catch (err) {
+    const sizeBytes = await getObjectSize(zipKey).catch(() => null);
+    throw new Error(
+      `Failed to parse ZIP from R2. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}. ` +
+        "If you recently switched to multipart uploads, verify each part PUT uploads raw bytes (Blob.slice/ArrayBuffer) and not multipart/form-data, " +
+        "and that the upload completes with all parts present.",
+      { cause: err }
+    );
+  } finally {
+    if (env.R2_SPOOL_KEEP_FILES_ON_ERROR) {
+      console.warn(`[zip-spool] keeping temp zip for inspection: ${tempPath}`);
+    } else {
+      await fs.unlink(tempPath).catch(() => undefined);
     }
-    const entryName = entry.path;
-    const processable = validateProcessableImageEntry(entryName);
-    if (processable) {
-      total += 1;
-    }
-    entry.autodrain();
+    release();
   }
   return total;
 };
@@ -1147,6 +1229,29 @@ export const processOcrJob = inngest.createFunction(
           storageKey: storageZipKey,
           contentType: "application/zip",
         });
+      }
+
+      // Validate the source ZIP in R2 and persist its size (helps detect truncated/corrupt uploads early)
+      const originalZipMeta = await getJobItemMetaByType(
+        jobId,
+        JobItemType.ORIGINAL_ZIP
+      );
+      const actualOriginalZipSizeBytes = await assertR2ObjectMatchesExpectedSize({
+        key: storageZipKey,
+        expectedSizeBytes: originalZipMeta?.sizeBytes ?? null,
+        context: `job ${jobId} ORIGINAL_ZIP`,
+      });
+
+      if (originalZipMeta && originalZipMeta.sizeBytes === null) {
+        await db
+          .update(ocrJobItems)
+          .set({ sizeBytes: actualOriginalZipSizeBytes })
+          .where(
+            and(
+              eq(ocrJobItems.jobId, jobId),
+              eq(ocrJobItems.itemType, JobItemType.ORIGINAL_ZIP)
+            )
+          );
       }
 
       // Estado actual en memoria (se irá actualizando manualmente)

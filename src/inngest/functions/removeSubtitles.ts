@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import archiver from "archiver";
 import { Transform } from "node:stream";
-import unzipper from "unzipper";
+import { env } from "@/config/env.config";
 import { inngest } from "@/inngest/client";
 import { db } from "@/db";
 import { ocrJobs, ocrJobItems } from "@/db/schema";
@@ -24,12 +24,14 @@ import { JobStep } from "@/types/enums/jobs/jobStep.enum";
 import { InngestEvents, OcrStepId } from "@/types/enums/inngest";
 import { InngestFunctions } from "@/types/enums/inngest/inngestFunctions.enum";
 import {
-  downloadObjectStream,
+  downloadObjectToTempFileVerified,
+  getObjectSize,
   uploadStreamToObject,
   uploadBufferToObject,
   getJobCroppedZipKey,
   getJobCroppedThumbnailKey,
 } from "@/utils/storage";
+import { forEachZipEntry, readStreamToBuffer } from "@/utils/zip/zipFile";
 
 type WorkspacePaths = {
   jobRootDir: string;
@@ -50,25 +52,56 @@ const ensureWorkspaceLayout = async (paths: WorkspacePaths) => {
   await fs.mkdir(VOLUME_DIRS.tmpBase, { recursive: true });
 };
 
+type JobItemMeta = {
+  storageKey: string;
+  sizeBytes: number | null;
+};
+
 /**
- * Helper function to get a job item by type
+ * Helper function to get a job item meta by type
  */
-const getJobItemByType = async (
+const getJobItemMetaByType = async (
   jobId: string,
   itemType: JobItemType
-): Promise<string | null> => {
+): Promise<JobItemMeta | null> => {
   const [item] = await db
-    .select()
+    .select({
+      storageKey: ocrJobItems.storageKey,
+      sizeBytes: ocrJobItems.sizeBytes,
+    })
     .from(ocrJobItems)
     .where(
-      and(
-        eq(ocrJobItems.jobId, jobId),
-        eq(ocrJobItems.itemType, itemType)
-      )
+      and(eq(ocrJobItems.jobId, jobId), eq(ocrJobItems.itemType, itemType))
     )
     .limit(1);
-  
-  return item?.storageKey ?? null;
+
+  if (!item?.storageKey) return null;
+  return { storageKey: item.storageKey, sizeBytes: item.sizeBytes ?? null };
+};
+
+const assertR2ObjectMatchesExpectedSize = async (params: {
+  key: string;
+  expectedSizeBytes: number | null;
+  context: string;
+}): Promise<number> => {
+  const actualSizeBytes = await getObjectSize(params.key);
+  if (actualSizeBytes === null) {
+    throw new Error(
+      `R2 object not found for ${params.context}. key="${params.key}"`
+    );
+  }
+
+  if (
+    params.expectedSizeBytes !== null &&
+    actualSizeBytes !== params.expectedSizeBytes
+  ) {
+    throw new Error(
+      `R2 object size mismatch for ${params.context}. key="${params.key}", expectedSizeBytes=${params.expectedSizeBytes}, actualSizeBytes=${actualSizeBytes}. ` +
+        "This usually means the uploaded ZIP is truncated/corrupt (common after an incorrect multipart upload implementation)."
+    );
+  }
+
+  return actualSizeBytes;
 };
 
 /**
@@ -93,20 +126,36 @@ const persistProgress = async (
  * Count processable images in zip without downloading content
  */
 const countProcessableImagesInZip = async (zipKey: string): Promise<number> => {
-  const zipReadable = await downloadObjectStream(zipKey);
-  const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
+  const { tempPath, release } = await downloadObjectToTempFileVerified({
+    key: zipKey,
+    prefix: "subtitle-count",
+  });
   let total = 0;
-  for await (const entry of unzipStream) {
-    if (entry.type === "Directory") {
-      entry.autodrain();
-      continue;
+  try {
+    await forEachZipEntry({
+      filePath: tempPath,
+      onEntry: async (entry) => {
+        if (entry.isDirectory) return;
+        const entryName = entry.fileName;
+        const processable = validateProcessableImageEntry(entryName);
+        if (processable) total += 1;
+      },
+    });
+  } catch (err) {
+    const sizeBytes = await getObjectSize(zipKey).catch(() => null);
+    throw new Error(
+      `Failed to parse ZIP from R2. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}. ` +
+        "If you recently switched to multipart uploads, verify each part PUT uploads raw bytes (Blob.slice/ArrayBuffer) and not multipart/form-data, " +
+        "and that the upload completes with all parts present.",
+      { cause: err }
+    );
+  } finally {
+    if (env.R2_SPOOL_KEEP_FILES_ON_ERROR) {
+      console.warn(`[zip-spool] keeping temp zip for inspection: ${tempPath}`);
+    } else {
+      await fs.unlink(tempPath).catch(() => undefined);
     }
-    const entryName = entry.path;
-    const processable = validateProcessableImageEntry(entryName);
-    if (processable) {
-      total += 1;
-    }
-    entry.autodrain();
+    release();
   }
   return total;
 };
@@ -126,8 +175,10 @@ const streamAndRemoveSubtitles = async ({
   croppedZipSizeBytes: number | null;
   croppedThumbnailKey: string | null;
 }> => {
-  const zipReadable = await downloadObjectStream(zipKey);
-  const unzipStream = zipReadable.pipe(unzipper.Parse({ forceStream: true }));
+  const { tempPath, release } = await downloadObjectToTempFileVerified({
+    key: zipKey,
+    prefix: "subtitle-stream",
+  });
 
   const archive = archiver("zip", { zlib: { level: 9 } });
   let filteredZipSizeBytes = 0;
@@ -148,42 +199,58 @@ const streamAndRemoveSubtitles = async ({
   let processedImages = 0;
   let firstImageBuffer: Buffer | null = null;
 
-  for await (const entry of unzipStream) {
-    if (entry.type === "Directory") {
-      entry.autodrain();
-      continue;
-    }
+  try {
+    await forEachZipEntry({
+      filePath: tempPath,
+      onEntry: async (entry) => {
+        if (entry.isDirectory) return;
 
-    const entryName = entry.path;
-    const processable = validateProcessableImageEntry(entryName);
-    if (!processable) {
-      entry.autodrain();
-      continue;
-    }
+        const entryName = entry.fileName;
+        const processable = validateProcessableImageEntry(entryName);
+        if (!processable) return;
 
-    const fileBuffer = await entry.buffer();
-    // Remove subtitles from the original image buffer.
-    // Important: do not normalize with "fit: contain" here, as it can introduce black borders.
-    const imageWithoutSubtitles = await removeSubtitlesFromBuffer(fileBuffer);
+        const fileStream = await entry.openReadStream();
+        const fileBuffer = await readStreamToBuffer(fileStream);
+      // Remove subtitles from the original image buffer.
+      // Important: do not normalize with "fit: contain" here, as it can introduce black borders.
+      const imageWithoutSubtitles = await removeSubtitlesFromBuffer(fileBuffer);
 
-    // Only include base images (1, 2, 3, etc.) in the final ZIP
-    // Skip decimal variants (1.1, 1.2, etc.) from the ZIP
-    if (processable.shouldIncludeInZip) {
-      // Extract original extension from originalName (e.g., "1.jpg" -> ".jpg")
-      const originalExt = processable.originalName.match(/\.(png|jpe?g)$/i)?.[0] || '.png';
-      const zipFilename = `${processable.baseName}${originalExt}`;
-      archive.append(imageWithoutSubtitles, { name: zipFilename });
+      // Only include base images (1, 2, 3, etc.) in the final ZIP
+      // Skip decimal variants (1.1, 1.2, etc.) from the ZIP
+      if (processable.shouldIncludeInZip) {
+        // Extract original extension from originalName (e.g., "1.jpg" -> ".jpg")
+        const originalExt =
+          processable.originalName.match(/\.(png|jpe?g)$/i)?.[0] || ".png";
+        const zipFilename = `${processable.baseName}${originalExt}`;
+        archive.append(imageWithoutSubtitles, { name: zipFilename });
 
-      // Save first image for thumbnail generation
-      if (!firstImageBuffer) {
-        firstImageBuffer = imageWithoutSubtitles;
+        // Save first image for thumbnail generation
+        if (!firstImageBuffer) {
+          firstImageBuffer = imageWithoutSubtitles;
+        }
       }
-    }
 
-    processedImages += 1;
-    if (onProgress && processedImages % 50 === 0) {
-      await onProgress(processedImages);
+        processedImages += 1;
+        if (onProgress && processedImages % 50 === 0) {
+          await onProgress(processedImages);
+        }
+      },
+    });
+  } catch (err) {
+    const sizeBytes = await getObjectSize(zipKey).catch(() => null);
+    throw new Error(
+      `Failed to stream ZIP entries from R2. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}. ` +
+        "This indicates the ZIP is truncated/corrupt. If the ZIP was uploaded via multipart, ensure each part PUT is raw bytes (not multipart/form-data) " +
+        "and that all parts are uploaded before completing the multipart upload.",
+      { cause: err }
+    );
+  } finally {
+    if (env.R2_SPOOL_KEEP_FILES_ON_ERROR) {
+      console.warn(`[zip-spool] keeping temp zip for inspection: ${tempPath}`);
+    } else {
+      await fs.unlink(tempPath).catch(() => undefined);
     }
+    release();
   }
 
   // Finalize archive first (this will trigger the end of the stream)
@@ -291,18 +358,32 @@ export const removeSubtitlesFromImages = inngest.createFunction(
         }
 
         // Get raw zip key from parent job items (final processed zip)
-        const parentRawZipKey = await getJobItemByType(parentJobId, JobItemType.RAW_ZIP);
-        if (!parentRawZipKey) {
+        const parentRawZipItem = await getJobItemMetaByType(
+          parentJobId,
+          JobItemType.RAW_ZIP
+        );
+        if (!parentRawZipItem) {
           console.error("Raw zip path missing for job - job may not be completed", parentJobId);
           return { jobId: "", croppedZipKey: null };
         }
 
-        rawZipKey = parentRawZipKey;
+        rawZipKey = parentRawZipItem.storageKey;
+        await assertR2ObjectMatchesExpectedSize({
+          key: rawZipKey,
+          expectedSizeBytes: parentRawZipItem.sizeBytes,
+          context: `parent job ${parentJobId} RAW_ZIP`,
+        });
         subtitleJobUserId = parentJob.userId;
         parentJobIdForSubtitle = parentJobId;
       } else if (zipKey) {
         // Direct zipKey provided - standalone subtitle removal job
         rawZipKey = zipKey;
+        // Best-effort validation (standalone job may not have DB sizeBytes)
+        await assertR2ObjectMatchesExpectedSize({
+          key: rawZipKey,
+          expectedSizeBytes: null,
+          context: `standalone zipKey`,
+        });
         subtitleJobUserId = userId;
         parentJobIdForSubtitle = null;
       } else {

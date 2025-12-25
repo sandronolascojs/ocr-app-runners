@@ -43,10 +43,14 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "unzipper": "^0.12.3",
+    "yauzl": "3.2.0",
     "zod": "^4.1.13"
   },
   "engines": {
     "node": ">=20.0.0"
   },
-  "packageManager": "pnpm@10.9.0"
+  "packageManager": "pnpm@10.9.0",
+  "devDependencies": {
+    "@types/yauzl": "2.10.3"
+  }
 }

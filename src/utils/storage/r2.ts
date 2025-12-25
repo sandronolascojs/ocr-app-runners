@@ -1,6 +1,8 @@
 import { createWriteStream, createReadStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { PassThrough, Transform, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -18,6 +20,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Upload } from "@aws-sdk/lib-storage";
 
 import { env } from "@/config/env.config";
+import { acquireZipSpool, getZipSpoolSnapshot } from "@/utils/spool/zipSpool";
 
 const r2Endpoint =
   env.CLOUDFLARE_R2_S3_ENDPOINT ??
@@ -27,6 +30,7 @@ const r2Client = new S3Client({
   region: "auto",
   endpoint: r2Endpoint,
   forcePathStyle: true,
+  maxAttempts: 10,
   credentials: {
     accessKeyId: env.CLOUDFLARE_R2_ACCESS_KEY_ID,
     secretAccessKey: env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
@@ -229,6 +233,353 @@ export const downloadObjectStream = async (key: string): Promise<Readable> => {
   }
 
   return response.Body as Readable;
+};
+
+const sleep = async (ms: number): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+};
+
+const jitterMs = (baseMs: number): number => {
+  const jitter = Math.floor(baseMs * (0.2 + Math.random() * 0.3)); // 20%-50%
+  return baseMs + jitter;
+};
+
+const isTransientStreamError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  // Conservative: treat common network disruptions as retryable.
+  return (
+    message.includes("ECONNRESET") ||
+    message.includes("socket hang up") ||
+    message.includes("ETIMEDOUT") ||
+    message.includes("EPIPE") ||
+    message.includes("502") ||
+    message.includes("503") ||
+    message.includes("504")
+  );
+};
+
+const randomId = (): string => {
+  // small, non-crypto id for temp file names
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
+const safeUnlink = async (filePath: string): Promise<void> => {
+  try {
+    await fsPromises.unlink(filePath);
+  } catch {
+    // ignore
+  }
+};
+
+export const downloadObjectToTempFileVerified = async (params: {
+  key: string;
+  prefix?: string;
+}): Promise<{ tempPath: string; sizeBytes: number; release: () => void }> => {
+  const sizeBytes = await getObjectSize(params.key);
+  if (typeof sizeBytes !== "number" || sizeBytes <= 0) {
+    throw new Error(
+      `Cannot spool ZIP: missing/invalid Content-Length for key="${params.key}".`
+    );
+  }
+
+  const lease = await acquireZipSpool(sizeBytes);
+  const snap = getZipSpoolSnapshot();
+  console.log(
+    `[zip-spool] acquired bytes=${sizeBytes} inUseBytes=${snap.inUseBytes}/${snap.budgetBytes} inFlight=${snap.inFlight} queued=${snap.queued}`
+  );
+
+  const filename = `${params.prefix ?? "zip"}-${randomId()}.zip`;
+  const tempPath = path.join(os.tmpdir(), filename);
+
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let written = 0;
+    try {
+      const response = await r2Client.send(
+        new GetObjectCommand({
+          Bucket: env.CLOUDFLARE_R2_BUCKET_NAME,
+          Key: params.key,
+        })
+      );
+
+      if (!response.Body) {
+        throw new Error(`R2 object ${params.key} has no body to download.`);
+      }
+
+      const readable = response.Body as Readable;
+      const counter = new Transform({
+        transform(chunk, _encoding, callback) {
+          written += chunk.length;
+          callback(null, chunk);
+        },
+      });
+
+      await pipeline(readable, counter, createWriteStream(tempPath));
+
+      if (written !== sizeBytes) {
+        throw new Error(
+          `Spool byte mismatch: expected=${sizeBytes}, actual=${written}`
+        );
+      }
+
+      // quick sanity: file exists and matches size
+      const st = await fsPromises.stat(tempPath);
+      if (st.size !== sizeBytes) {
+        throw new Error(
+          `Spool file size mismatch on disk: expected=${sizeBytes}, actual=${st.size}`
+        );
+      }
+
+      return {
+        tempPath,
+        sizeBytes,
+        release: () => {
+          lease.release();
+          const s = getZipSpoolSnapshot();
+          console.log(
+            `[zip-spool] released bytes=${sizeBytes} inUseBytes=${s.inUseBytes}/${s.budgetBytes} inFlight=${s.inFlight} queued=${s.queued}`
+          );
+        },
+      };
+    } catch (error) {
+      console.warn(
+        `[zip-spool] download attempt ${attempt}/${maxAttempts} failed key="${params.key}" expected=${sizeBytes} written=${written}:`,
+        error instanceof Error ? error.message : error
+      );
+      await safeUnlink(tempPath);
+      if (attempt === maxAttempts) {
+        lease.release();
+        throw error;
+      }
+      await sleep(jitterMs(Math.min(10_000, 500 * 2 ** (attempt - 1))));
+    }
+  }
+
+  // unreachable
+  lease.release();
+  throw new Error("Failed to spool ZIP to temp file.");
+};
+
+/**
+ * Resumable streaming download for very large objects.
+ *
+ * Why: piping a single long-lived GetObject stream into unzipper is fragile.
+ * Any mid-stream network hiccup truncates the ZIP and causes `unexpected end of file`.
+ *
+ * This helper re-issues ranged GetObject requests from the last confirmed byte offset
+ * and presents a continuous stream to consumers (unzipper).
+ */
+export const downloadObjectStreamResumableWindowed = async (params: {
+  key: string;
+  expectedSizeBytes?: number;
+  windowBytes?: number;
+}): Promise<Readable> => {
+  const expectedFromHead = await getObjectSize(params.key);
+  const expectedSizeBytes =
+    params.expectedSizeBytes ?? expectedFromHead ?? null;
+
+  if (typeof expectedSizeBytes !== "number" || expectedSizeBytes <= 0) {
+    throw new Error(
+      `Cannot start resumable download: missing/invalid object size for key="${params.key}".`
+    );
+  }
+
+  const windowBytes =
+    params.windowBytes ??
+    Math.max(1, env.R2_RANGE_WINDOW_MIB) * 1024 * 1024;
+  const maxRetriesPerWindow = env.R2_RANGE_MAX_RETRIES;
+
+  const out = new PassThrough();
+
+  void (async () => {
+    let offset = 0;
+
+    while (offset < expectedSizeBytes) {
+      const requestStartOffset = offset;
+      const requestEndOffset = Math.min(
+        expectedSizeBytes - 1,
+        requestStartOffset + windowBytes - 1
+      );
+      const expectedBytesThisWindow = requestEndOffset - requestStartOffset + 1;
+      const range: string = `bytes=${requestStartOffset}-${requestEndOffset}`;
+      let retries = 0;
+
+      while (true) {
+        try {
+          const response = await r2Client.send(
+            new GetObjectCommand({
+              Bucket: env.CLOUDFLARE_R2_BUCKET_NAME,
+              Key: params.key,
+              Range: range,
+            })
+          );
+
+          if (!response.Body) {
+            throw new Error(`R2 object ${params.key} has no body to download.`);
+          }
+
+          // Validate Content-Range strictly: start must match requested start and total must match object size.
+          if (response.ContentRange) {
+            const match: RegExpMatchArray | null = response.ContentRange.match(
+              /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i
+            );
+            if (!match) {
+              throw new Error(
+                `Unexpected Content-Range format: "${response.ContentRange}"`
+              );
+            }
+            const start = Number(match[1]);
+            const end = Number(match[2]);
+            const total: number | null =
+              match[3] === "*" ? null : Number(match[3]);
+
+            if (!Number.isFinite(start) || start !== requestStartOffset) {
+              throw new Error(
+                `Content-Range start mismatch. expected=${requestStartOffset}, actual=${start}, contentRange="${response.ContentRange}"`
+              );
+            }
+            if (!Number.isFinite(end) || end !== requestEndOffset) {
+              throw new Error(
+                `Content-Range end mismatch. expected=${requestEndOffset}, actual=${end}, contentRange="${response.ContentRange}"`
+              );
+            }
+            if (
+              typeof total === "number" &&
+              Number.isFinite(total) &&
+              total !== expectedSizeBytes
+            ) {
+              throw new Error(
+                `Content-Range total mismatch. expected=${expectedSizeBytes}, actual=${total}, contentRange="${response.ContentRange}"`
+              );
+            }
+          }
+
+          const readable = response.Body as Readable;
+          let bytesThisRequest = 0;
+
+          for await (const chunk of readable) {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            bytesThisRequest += buf.length;
+            offset += buf.length;
+
+            if (!out.write(buf)) {
+              await new Promise<void>((resolve) => out.once("drain", resolve));
+            }
+          }
+
+          if (bytesThisRequest !== expectedBytesThisWindow) {
+            // Critical invariant: we must deliver the exact bytes for this window or retry.
+            throw new Error(
+              `Truncated window. key="${params.key}" range="${range}" expectedBytes=${expectedBytesThisWindow} receivedBytes=${bytesThisRequest}`
+            );
+          }
+
+          break; // success for this window
+        } catch (error) {
+          retries += 1;
+          const msg = error instanceof Error ? error.message : String(error);
+          console.warn(
+            `[r2-windowed] error key="${params.key}" range="${range}" offset=${offset}/${expectedSizeBytes} retry=${retries}/${maxRetriesPerWindow}: ${msg}`
+          );
+
+          if (!isTransientStreamError(error) && !msg.includes("Truncated window")) {
+            out.destroy(
+              new Error(
+                `Non-retryable download error for key="${params.key}" range="${range}": ${msg}`,
+                { cause: error as any }
+              )
+            );
+            return;
+          }
+
+          if (retries >= maxRetriesPerWindow) {
+            out.destroy(
+              new Error(
+                `Exceeded max retries for key="${params.key}" range="${range}" at offset=${offset}/${expectedSizeBytes}. LastError=${msg}`,
+                { cause: error as any }
+              )
+            );
+            return;
+          }
+
+          // Reset offset back to window start before retrying (avoid partial window duplication).
+          offset = requestStartOffset;
+
+          // Exponential backoff + jitter.
+          const base = Math.min(10_000, 300 * 2 ** Math.min(6, retries - 1));
+          await sleep(jitterMs(base));
+          continue;
+        }
+      }
+
+      // Completed a full verified window; loop continues to next window (offset already advanced).
+    }
+
+    // Should not happen; if it does, fail loudly.
+    out.destroy(
+      new Error(
+        `Resumable download ended unexpectedly for key="${params.key}". offset=${offset}, expected=${expectedSizeBytes}`
+      )
+    );
+  })();
+
+  return out;
+};
+
+/**
+ * Lightweight ZIP integrity preflight without disk:
+ * fetch the tail (typically contains EOCD) and ensure EOCD signature exists.
+ */
+export const assertZipTailLooksValid = async (params: {
+  key: string;
+  expectedSizeBytes?: number;
+}): Promise<void> => {
+  const expectedFromHead = await getObjectSize(params.key);
+  const expectedSizeBytes =
+    params.expectedSizeBytes ?? expectedFromHead ?? null;
+
+  if (typeof expectedSizeBytes !== "number" || expectedSizeBytes <= 0) {
+    throw new Error(
+      `Cannot validate ZIP tail: missing/invalid object size for key="${params.key}".`
+    );
+  }
+
+  const tailSize = Math.min(128 * 1024, expectedSizeBytes);
+  const start = Math.max(0, expectedSizeBytes - tailSize);
+  const range = `bytes=${start}-${expectedSizeBytes - 1}`;
+
+  const response = await r2Client.send(
+    new GetObjectCommand({
+      Bucket: env.CLOUDFLARE_R2_BUCKET_NAME,
+      Key: params.key,
+      Range: range,
+    })
+  );
+
+  if (!response.Body) {
+    throw new Error(`R2 object ${params.key} has no body to download.`);
+  }
+
+  const readable = response.Body as Readable;
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of readable) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    chunks.push(buf);
+    total += buf.length;
+    if (total > 256 * 1024) break;
+  }
+
+  const tail = Buffer.concat(chunks, total);
+  // EOCD signature: 0x06054b50 (PK\x05\x06)
+  const eocdSig = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
+  if (tail.indexOf(eocdSig) === -1) {
+    throw new Error(
+      `ZIP tail validation failed for key="${params.key}". EOCD signature not found in last ${tailSize} bytes.`
+    );
+  }
 };
 
 export const uploadFileToObject = async (params: {

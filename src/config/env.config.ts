@@ -21,6 +21,11 @@ export const env = createEnv({
       .int()
       .positive()
       .default(900),
+    R2_RANGE_WINDOW_MIB: z.coerce.number().int().positive().default(64),
+    R2_RANGE_MAX_RETRIES: z.coerce.number().int().positive().default(10),
+    R2_SPOOL_BUDGET_GB: z.coerce.number().int().positive().default(50),
+    R2_SPOOL_MAX_CONCURRENCY: z.coerce.number().int().positive().default(1),
+    R2_SPOOL_KEEP_FILES_ON_ERROR: z.coerce.boolean().default(false),
   },
   runtimeEnv: process.env,
 });
