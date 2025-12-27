@@ -42,6 +42,16 @@ import type { OpenAI } from "openai";
 import { InngestFunctions } from "@/types/enums/inngest/inngestFunctions.enum";
 import { AI_CONSTANTS } from "@/constants/ai.constants";
 import {
+  MIN_BATCH_SIZE,
+  INITIAL_BACKOFF_MS,
+  MAX_BACKOFF_MS,
+  adjustBatchSizeOnTokenError,
+  describeError,
+  isRateLimitError,
+  isServerError,
+  isTokenLimitError,
+} from "./batchHelpers";
+import {
   getJobDocxKey,
   getJobRawArchiveKey,
   getJobTxtKey,
@@ -59,8 +69,7 @@ import { forEachZipEntry, readStreamToBuffer } from "@/utils/zip/zipFile";
 import { env } from "@/config/env.config";
 
 const BATCH_SLEEP_INTERVAL = "20s";
-const BATCH_SIZE = 450; // Reduced from 1000 to avoid token limit errors
-const BATCH_SIZE_REDUCTION_STEPS = [400, 300, 200, 100, 50]; // Tamaños de batch a probar cuando hay error de token limit
+const BATCH_SIZE = 400; // Reduced from 1000 to avoid token limit errors
 
 type CropMeta = {
   filename: string;
@@ -130,6 +139,8 @@ type PersistableFrame = {
 const CROP_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24; // 24 hours
 const CROP_SIGNED_URL_EXPIRY_SAFETY_SECONDS = 5 * 60; // refresh 5 minutes before expiry
 const cropSignedUrlTtlSeconds = env.CROP_SIGNED_URL_TTL_SECONDS ?? CROP_SIGNED_URL_TTL_SECONDS;
+const sleepMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 type JobItemMeta = {
   storageKey: string;
@@ -274,6 +285,9 @@ const hasExpired = (signedAt?: string): boolean => {
 const getProcessedBatchesPath = (jobId: string): string =>
   path.join(getJobCropsDir(jobId), "processedBatches.json");
 
+const getBatchSizeHintPath = (jobId: string): string =>
+  path.join(getJobCropsDir(jobId), "batchSizeHint.json");
+
 const loadProcessedBatches = (jobId: string): PersistedProcessedBatch[] => {
   const filePath = getProcessedBatchesPath(jobId);
   if (!fsSync.existsSync(filePath)) return [];
@@ -321,6 +335,27 @@ const persistProcessedBatches = async (
   const filePath = getProcessedBatchesPath(jobId);
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(filePath, JSON.stringify(batches, null, 2), "utf8");
+};
+
+const loadBatchSizeHint = (jobId: string): number | null => {
+  const filePath = getBatchSizeHintPath(jobId);
+  if (!fsSync.existsSync(filePath)) return null;
+  try {
+    const raw = fsSync.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.batchSize === "number" && parsed.batchSize > 0) {
+      return parsed.batchSize;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const persistBatchSizeHint = async (jobId: string, batchSize: number): Promise<void> => {
+  const filePath = getBatchSizeHintPath(jobId);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify({ batchSize }), "utf8");
 };
 
 const refreshCropSignedUrls = async ({
@@ -1587,7 +1622,11 @@ export const processOcrJob = inngest.createFunction(
 
       if (currentStep === JobStep.BATCH_SUBMITTED) {
         // Divide cropsMeta into chunks - start with default BATCH_SIZE
-        let currentBatchSize = BATCH_SIZE;
+        const batchSizeHint = loadBatchSizeHint(jobId);
+        let currentBatchSize = Math.max(
+          MIN_BATCH_SIZE,
+          Math.min(BATCH_SIZE, batchSizeHint ?? BATCH_SIZE)
+        );
 
         const cachedProcessedBatches = loadProcessedBatches(jobId).sort(
           (a, b) => a.batchIndex - b.batchIndex
@@ -1612,6 +1651,7 @@ export const processOcrJob = inngest.createFunction(
 
         let totalBatches = processedBatches.length + cropsChunks.length;
         let processedItemsCount = processedItemsCountInitial;
+        let backoffMs = INITIAL_BACKOFF_MS;
 
         progress.totalBatches = totalBatches;
         progress.batchesCompleted = Math.max(progress.batchesCompleted ?? 0, processedBatches.length);
@@ -1647,131 +1687,92 @@ export const processOcrJob = inngest.createFunction(
           // Token limit can happen after the batch is created (status flips to failed).
           // In that case we backoff + shrink batch size and re-create a new batch with a new step id.
           while (true) {
-            // Try to create batch with retry logic for token limit errors
-            // Wrap the entire retry logic in step.run for idempotency
             const artifacts = await step.run(
               `${OcrStepId.CreateAndAwaitBatch}-${batchIndex}-enqueueRetry-${enqueueRetry}`,
               async () => {
-              let result: BatchArtifacts | null = null;
-              let retryAttempt = 0;
-              let localBatchSize = currentBatchSize;
-              let localChunks = [...cropsChunks];
-              let localChunk = localChunks[batchIndex];
-              
-              const currentBatchSizeIndex = BATCH_SIZE_REDUCTION_STEPS.indexOf(localBatchSize);
-              const maxRetries = BATCH_SIZE_REDUCTION_STEPS.length - 1 - (currentBatchSizeIndex >= 0 ? currentBatchSizeIndex : 0);
+                let attempt = 0;
+                while (true) {
+                  try {
+                    if (!chunk || chunk.length === 0) {
+                      throw new Error(`Empty chunk at batch index ${batchIndex}`);
+                    }
 
-              while (!result && retryAttempt <= maxRetries) {
-                try {
-                  if (!localChunk || localChunk.length === 0) {
-                    throw new Error(`Empty chunk at batch index ${batchIndex}`);
-                  }
+                    console.log(
+                      `Attempting batch ${batchIndex + 1} with ${chunk.length} items (batch size: ${currentBatchSize}, attempt: ${attempt + 1})`
+                    );
 
-                  console.log(
-                    `Attempting to create batch ${batchIndex + 1} with ${localChunk.length} items (batch size: ${localBatchSize}, retry attempt: ${retryAttempt})`
-                  );
+                    const result = await createBatchArtifacts({
+                      jobId,
+                      cropsMeta: chunk,
+                      batchIndex,
+                      globalStartIndex,
+                      openai,
+                    });
 
-                  // Create batch artifacts (JSONL file and OpenAI batch)
-                  result = await createBatchArtifacts({
-                    jobId,
-                    cropsMeta: localChunk,
-                    batchIndex,
-                    globalStartIndex,
-                    openai,
-                  });
-                } catch (error) {
-                  const errorMessage = error instanceof Error ? error.message : String(error);
-                  
-                  console.error(
-                    `Error creating batch ${batchIndex + 1} (attempt ${retryAttempt + 1}):`,
-                    errorMessage
-                  );
+                    await persistBatchSizeHint(jobId, currentBatchSize);
+                    backoffMs = INITIAL_BACKOFF_MS;
+                    return result;
+                  } catch (error) {
+                    console.warn(
+                      `Batch ${batchIndex + 1} creation failed (attempt ${attempt + 1}): ${describeError(error)}`
+                    );
 
-                  if (errorMessage.startsWith("TOKEN_LIMIT_ERROR:") && retryAttempt < maxRetries) {
-                    // Find next smaller batch size
-                    const currentRetryIndex = BATCH_SIZE_REDUCTION_STEPS.indexOf(localBatchSize);
-                    if (currentRetryIndex < BATCH_SIZE_REDUCTION_STEPS.length - 1) {
-                      const newBatchSize = BATCH_SIZE_REDUCTION_STEPS[currentRetryIndex + 1];
-                      retryAttempt += 1;
-
-                      console.warn(
-                        `Token limit error for batch ${batchIndex + 1}. Reducing batch size from ${localBatchSize} to ${newBatchSize} (attempt ${retryAttempt + 1}/${maxRetries + 1})`
-                      );
-
-                      // Re-chunk the current chunk with new batch size
-                      // Take only the first part of the current chunk
-                      const chunkToRetry = localChunk.slice(0, newBatchSize);
-                      
-                      if (chunkToRetry.length === 0) {
+                    if (isTokenLimitError(error)) {
+                      const newSize = Math.max(MIN_BATCH_SIZE, Math.floor(currentBatchSize / 2));
+                      if (newSize >= currentBatchSize && currentBatchSize === MIN_BATCH_SIZE) {
                         throw new Error(
-                          `No items in chunk after reducing batch size to ${newBatchSize}`
+                          `Token limit at minimum batch size ${MIN_BATCH_SIZE}. Last error: ${error instanceof Error ? error.message : String(error)}`
                         );
                       }
 
-                      // Update local chunk to the smaller size
-                      localChunk = chunkToRetry;
-                      localBatchSize = newBatchSize;
+                      const remainingFromCurrent = cropsChunks
+                        .slice(pendingIndex)
+                        .reduce<CropMeta[]>((acc, curr) => acc.concat(curr), []);
 
-                      console.log(
-                        `Retrying with reduced chunk size: ${chunkToRetry.length} items (from original ${localChunks[batchIndex].length})`
+                      if (!remainingFromCurrent.length) {
+                        throw new Error(
+                          `Cannot retry batch ${batchIndex + 1}: no remaining crops to re-split after token limit`
+                        );
+                      }
+
+                      currentBatchSize = newSize;
+                      cropsChunks = chunkArray(remainingFromCurrent, currentBatchSize);
+                      totalBatches = processedBatches.length + cropsChunks.length;
+                      progress.totalBatches = totalBatches;
+                      await persistProgress(jobId, progress);
+
+                      console.warn(
+                        `Token/context limit for batch ${batchIndex + 1}; reducing batch size to ${currentBatchSize} and rechunking remaining ${remainingFromCurrent.length} crops into ${cropsChunks.length} batches`
                       );
 
-                      // Continue retry loop with smaller chunk
-                      continue;
-                    } else {
-                      throw new Error(
-                        `Token limit error and no smaller batch size available. Current: ${localBatchSize}, Steps: ${BATCH_SIZE_REDUCTION_STEPS.join(", ")}`
-                      );
+                      pendingIndex = 0;
+                      attempt += 1;
+                      backoffMs = INITIAL_BACKOFF_MS;
+                      // Restart outer loop with new chunks
+                      return null as unknown as BatchArtifacts;
                     }
-                  }
 
-                  // If we've exhausted all retry sizes or it's a different error, throw
-                  throw error;
+                    if (isRateLimitError(error) || isServerError(error)) {
+                      const waitMs = backoffMs;
+                      backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+                      console.warn(
+                        `Rate/server limit for batch ${batchIndex + 1}. Waiting ${waitMs}ms before retry (next backoff ${backoffMs}ms)`
+                      );
+                      await sleepMs(waitMs);
+                      attempt += 1;
+                      continue;
+                    }
+
+                    throw error;
+                  }
                 }
               }
-
-              if (!result) {
-                throw new Error(
-                  `Failed to create batch ${batchIndex} after ${retryAttempt} attempts with different batch sizes.`
-                );
-              }
-
-              // Update the global state if batch size was reduced
-              if (localBatchSize !== currentBatchSize) {
-                // Get the original chunk to see what items remain
-                const originalChunk = cropsChunks[pendingIndex];
-                const processedInThisBatch = localChunk.length;
-                const remainingInOriginalChunk = originalChunk.slice(processedInThisBatch);
-                
-                // Re-chunk all remaining items (from this chunk + all subsequent chunks) with new batch size
-                const remainingCrops = [
-                  ...remainingInOriginalChunk,
-                  ...cropsMeta.slice(processedItemsCount + originalChunk.length)
-                ];
-                const newChunks = chunkArray(remainingCrops, localBatchSize);
-
-                // Replace chunks from current batchIndex onwards with the new smaller chunks
-                cropsChunks.splice(pendingIndex, cropsChunks.length - pendingIndex, ...newChunks);
-
-                // Update current batch size for future batches
-                currentBatchSize = localBatchSize;
-
-                // Recalculate total batches
-                const remainingItems = cropsMeta.length - processedItemsCount - processedInThisBatch;
-                totalBatches =
-                  processedBatches.length + pendingIndex + 1 + Math.ceil(remainingItems / localBatchSize);
-
-                progress.totalBatches = totalBatches;
-                await persistProgress(jobId, progress);
-
-                console.log(
-                  `Batch size reduced to ${localBatchSize}. Processed ${processedInThisBatch} items, re-chunked remaining ${remainingItems} items into ${newChunks.length} batches`
-                );
-              }
-
-              return result;
-            }
             );
+
+          if (!artifacts) {
+            // Batch size was reduced and chunks were rebuilt; restart loop with new chunks.
+            continue;
+          }
 
             if (!artifacts || !artifacts.batchId) {
               throw new Error(
@@ -1822,11 +1823,7 @@ export const processOcrJob = inngest.createFunction(
                 });
 
                 if (failureMessage && isTokenLimitFailure(failureMessage)) {
-                  const idx = BATCH_SIZE_REDUCTION_STEPS.indexOf(currentBatchSize);
-                  const nextBatchSize =
-                    idx >= 0 && idx < BATCH_SIZE_REDUCTION_STEPS.length - 1
-                      ? BATCH_SIZE_REDUCTION_STEPS[idx + 1]!
-                      : currentBatchSize;
+                  const nextBatchSize = adjustBatchSizeOnTokenError(currentBatchSize);
 
                   console.warn(
                     `[token-limit] Batch failed after creation. jobId=${jobId} batchIndex=${batchIndex} status=${batchStatus.status} ` +
