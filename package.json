@@ -27,7 +27,6 @@
     "@t3-oss/env-core": "^0.13.8",
     "@types/archiver": "^7.0.0",
     "@types/node": "^25.0.0",
-    "@types/unzipper": "^0.10.11",
     "archiver": "^7.0.1",
     "docx": "^9.5.1",
     "dotenv-cli": "^11.0.0",
@@ -42,7 +41,6 @@
     "tsup": "^8.5.1",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "unzipper": "^0.12.3",
     "yauzl": "3.2.0",
     "zod": "^4.1.13"
   },
