@@ -1,7 +1,6 @@
 import * as fs from "node:fs/promises";
 import archiver from "archiver";
 import { Transform } from "node:stream";
-import { env } from "@/config/env.config";
 import { inngest } from "@/inngest/client";
 import { db } from "@/db";
 import { ocrJobs, ocrJobItems } from "@/db/schema";
@@ -24,7 +23,7 @@ import { JobStep } from "@/types/enums/jobs/jobStep.enum";
 import { InngestEvents, OcrStepId } from "@/types/enums/inngest";
 import { InngestFunctions } from "@/types/enums/inngest/inngestFunctions.enum";
 import {
-  downloadObjectToTempFileVerified,
+  withTempFileFromR2,
   getObjectSize,
   uploadStreamToObject,
   uploadBufferToObject,
@@ -126,41 +125,27 @@ const persistProgress = async (
  * Count processable images in zip without downloading content
  */
 const countProcessableImagesInZip = async (zipKey: string): Promise<number> => {
-  const { tempPath, release } = await downloadObjectToTempFileVerified({
+  return withTempFileFromR2({
     key: zipKey,
     prefix: "subtitle-count",
+    fn: async (tempPath) => {
+      let total = 0;
+      await forEachZipEntry({
+        filePath: tempPath,
+        onEntry: async (entry) => {
+          if (entry.isDirectory) return;
+          const entryName = entry.fileName;
+          const processable = validateProcessableImageEntry(entryName);
+          if (processable) total += 1;
+        },
+      });
+      return total;
+    },
   });
-  let total = 0;
-  try {
-    await forEachZipEntry({
-      filePath: tempPath,
-      onEntry: async (entry) => {
-        if (entry.isDirectory) return;
-        const entryName = entry.fileName;
-        const processable = validateProcessableImageEntry(entryName);
-        if (processable) total += 1;
-      },
-    });
-  } catch (err) {
-    const sizeBytes = await getObjectSize(zipKey).catch(() => null);
-    throw new Error(
-      `Failed to parse ZIP from R2. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}. ` +
-        "If you recently switched to multipart uploads, verify each part PUT uploads raw bytes (Blob.slice/ArrayBuffer) and not multipart/form-data, " +
-        "and that the upload completes with all parts present.",
-      { cause: err }
-    );
-  } finally {
-    if (env.R2_SPOOL_KEEP_FILES_ON_ERROR) {
-      console.warn(`[zip-spool] keeping temp zip for inspection: ${tempPath}`);
-    } else {
-      await fs.unlink(tempPath).catch(() => undefined);
-    }
-    release();
-  }
-  return total;
 };
 
 const streamAndRemoveSubtitles = async ({
+  jobId,
   zipKey,
   storageKeys,
   onProgress,
@@ -175,122 +160,111 @@ const streamAndRemoveSubtitles = async ({
   croppedZipSizeBytes: number | null;
   croppedThumbnailKey: string | null;
 }> => {
-  const { tempPath, release } = await downloadObjectToTempFileVerified({
+  return withTempFileFromR2({
     key: zipKey,
     prefix: "subtitle-stream",
-  });
+    fn: async (tempPath) => {
+      const archive = archiver("zip", { zlib: { level: 9 } });
+      let filteredZipSizeBytes = 0;
+      const sizeCounter = new Transform({
+        transform(chunk, _encoding, callback) {
+          filteredZipSizeBytes += chunk.length;
+          callback(null, chunk);
+        },
+      });
 
-  const archive = archiver("zip", { zlib: { level: 9 } });
-  let filteredZipSizeBytes = 0;
-  const sizeCounter = new Transform({
-    transform(chunk, _encoding, callback) {
-      filteredZipSizeBytes += chunk.length;
-      callback(null, chunk);
-    },
-  });
+      const archiveOutput = archive.pipe(sizeCounter);
+      const filteredZipUploadPromise = uploadStreamToObject({
+        key: storageKeys.croppedZipKey,
+        stream: archiveOutput,
+        contentType: "application/zip",
+      });
 
-  const archiveOutput = archive.pipe(sizeCounter);
-  const filteredZipUploadPromise = uploadStreamToObject({
-    key: storageKeys.croppedZipKey,
-    stream: archiveOutput,
-    contentType: "application/zip",
-  });
+      let processedImages = 0;
+      let firstImageBuffer: Buffer | null = null;
+      let failedEntries = 0;
+      const failedEntryNames: string[] = [];
 
-  let processedImages = 0;
-  let firstImageBuffer: Buffer | null = null;
+      await forEachZipEntry({
+        filePath: tempPath,
+        onEntry: async (entry) => {
+          if (entry.isDirectory) return;
 
-  try {
-    await forEachZipEntry({
-      filePath: tempPath,
-      onEntry: async (entry) => {
-        if (entry.isDirectory) return;
+          const entryName = entry.fileName;
+          const processable = validateProcessableImageEntry(entryName);
+          if (!processable) return;
 
-        const entryName = entry.fileName;
-        const processable = validateProcessableImageEntry(entryName);
-        if (!processable) return;
+          try {
+            const fileStream = await entry.openReadStream();
+            const fileBuffer = await readStreamToBuffer(fileStream, {
+              expectedBytes: entry.uncompressedSize,
+              context: `entry="${entry.fileName}"`,
+            });
+            const imageWithoutSubtitles = await removeSubtitlesFromBuffer(fileBuffer);
 
-        const fileStream = await entry.openReadStream();
-        const fileBuffer = await readStreamToBuffer(fileStream);
-      // Remove subtitles from the original image buffer.
-      // Important: do not normalize with "fit: contain" here, as it can introduce black borders.
-      const imageWithoutSubtitles = await removeSubtitlesFromBuffer(fileBuffer);
+            if (processable.shouldIncludeInZip) {
+              const originalExt =
+                processable.originalName.match(/\.(png|jpe?g)$/i)?.[0] || ".png";
+              const zipFilename = `${processable.baseName}${originalExt}`;
+              archive.append(imageWithoutSubtitles, { name: zipFilename });
 
-      // Only include base images (1, 2, 3, etc.) in the final ZIP
-      // Skip decimal variants (1.1, 1.2, etc.) from the ZIP
-      if (processable.shouldIncludeInZip) {
-        // Extract original extension from originalName (e.g., "1.jpg" -> ".jpg")
-        const originalExt =
-          processable.originalName.match(/\.(png|jpe?g)$/i)?.[0] || ".png";
-        const zipFilename = `${processable.baseName}${originalExt}`;
-        archive.append(imageWithoutSubtitles, { name: zipFilename });
+              if (!firstImageBuffer) {
+                firstImageBuffer = imageWithoutSubtitles;
+              }
+            }
 
-        // Save first image for thumbnail generation
-        if (!firstImageBuffer) {
-          firstImageBuffer = imageWithoutSubtitles;
-        }
+            processedImages += 1;
+            if (onProgress && processedImages % 50 === 0) {
+              await onProgress(processedImages);
+            }
+          } catch (err) {
+            failedEntries += 1;
+            if (failedEntryNames.length < 20) {
+              failedEntryNames.push(entry.fileName);
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(
+              `[zip-entry] skipping corrupt entry jobId=${jobId} entry="${entry.fileName}" uncompressedSize=${entry.uncompressedSize}: ${msg}`
+            );
+          }
+        },
+      });
+
+      if (failedEntries > 0) {
+        console.warn(
+          `[zip-entry] jobId=${jobId} skippedEntries=${failedEntries} examples=${failedEntryNames.join(
+            ", "
+          )}`
+        );
       }
 
-        processedImages += 1;
-        if (onProgress && processedImages % 50 === 0) {
-          await onProgress(processedImages);
-        }
-      },
-    });
-  } catch (err) {
-    const sizeBytes = await getObjectSize(zipKey).catch(() => null);
-    throw new Error(
-      `Failed to stream ZIP entries from R2. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}. ` +
-        "This indicates the ZIP is truncated/corrupt. If the ZIP was uploaded via multipart, ensure each part PUT is raw bytes (not multipart/form-data) " +
-        "and that all parts are uploaded before completing the multipart upload.",
-      { cause: err }
-    );
-  } finally {
-    if (env.R2_SPOOL_KEEP_FILES_ON_ERROR) {
-      console.warn(`[zip-spool] keeping temp zip for inspection: ${tempPath}`);
-    } else {
-      await fs.unlink(tempPath).catch(() => undefined);
-    }
-    release();
-  }
+      await archive.finalize();
+      await filteredZipUploadPromise;
 
-  // Finalize archive first (this will trigger the end of the stream)
-  // The sizeCounter Transform will continue counting until the stream ends
-  await archive.finalize();
-  
-  // Wait for upload to complete - this ensures the file is fully uploaded and size is finalized
-  await filteredZipUploadPromise;
+      if (onProgress) {
+        await onProgress(processedImages);
+      }
 
-  // Size should be finalized now after the stream has ended
-  const finalSizeBytes = filteredZipSizeBytes;
-  
-  console.log(
-    `Upload completed for cropped ZIP: ${storageKeys.croppedZipKey}, size: ${finalSizeBytes} bytes, processed images: ${processedImages}`
-  );
+      let croppedThumbnailKey: string | null = null;
+      if (firstImageBuffer && processedImages > 0) {
+        const thumbnailBuffer = await createThumbnailFromBuffer(firstImageBuffer);
+        await uploadBufferToObject({
+          key: storageKeys.croppedThumbnailKey,
+          body: thumbnailBuffer,
+          contentType: "image/jpeg",
+          cacheControl: "public, max-age=31536000, immutable",
+        });
+        croppedThumbnailKey = storageKeys.croppedThumbnailKey;
+      }
 
-  // Final progress update
-  if (onProgress) {
-    await onProgress(processedImages);
-  }
-
-  // Generate thumbnail from first cropped image
-  let croppedThumbnailKey: string | null = null;
-  if (firstImageBuffer && processedImages > 0) {
-    const thumbnailBuffer = await createThumbnailFromBuffer(firstImageBuffer);
-    await uploadBufferToObject({
-      key: storageKeys.croppedThumbnailKey,
-      body: thumbnailBuffer,
-      contentType: "image/jpeg",
-      cacheControl: "public, max-age=31536000, immutable",
-    });
-    croppedThumbnailKey = storageKeys.croppedThumbnailKey;
-  }
-
-  return {
-    totalImages: processedImages,
-    croppedZipKey: processedImages > 0 ? storageKeys.croppedZipKey : null,
-    croppedZipSizeBytes: processedImages > 0 ? finalSizeBytes : null,
-    croppedThumbnailKey,
-  };
+      return {
+        totalImages: processedImages,
+        croppedZipKey: processedImages > 0 ? storageKeys.croppedZipKey : null,
+        croppedZipSizeBytes: processedImages > 0 ? filteredZipSizeBytes : null,
+        croppedThumbnailKey,
+      };
+    },
+  });
 };
 
 export const removeSubtitlesFromImages = inngest.createFunction(

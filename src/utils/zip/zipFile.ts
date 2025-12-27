@@ -44,7 +44,13 @@ const openEntryStream = async (
   });
 };
 
-export const readStreamToBuffer = async (stream: Readable): Promise<Buffer> => {
+export const readStreamToBuffer = async (
+  stream: Readable,
+  opts?: {
+    expectedBytes?: number;
+    context?: string;
+  }
+): Promise<Buffer> => {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of stream) {
@@ -52,6 +58,16 @@ export const readStreamToBuffer = async (stream: Readable): Promise<Buffer> => {
     chunks.push(buf);
     total += buf.length;
   }
+
+  if (typeof opts?.expectedBytes === "number" && opts.expectedBytes >= 0) {
+    if (total !== opts.expectedBytes) {
+      const ctx = opts.context ? ` (${opts.context})` : "";
+      throw new Error(
+        `Truncated zip entry stream${ctx}: expectedBytes=${opts.expectedBytes}, actualBytes=${total}`
+      );
+    }
+  }
+
   return Buffer.concat(chunks, total);
 };
 
@@ -81,7 +97,12 @@ export const forEachZipEntry = async (params: {
             });
             next();
           } catch (err) {
-            reject(err);
+            reject(
+              new Error(
+                `ZIP entry processing failed: entry="${entry.fileName}", uncompressedSize=${entry.uncompressedSize}, compressedSize=${entry.compressedSize}`,
+                { cause: err as any }
+              )
+            );
           }
         })();
       });

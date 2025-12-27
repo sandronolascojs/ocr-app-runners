@@ -51,6 +51,7 @@ import {
   uploadStreamToObject,
   createSignedDownloadUrlWithTtl,
   downloadObjectToTempFileVerified,
+  withTempFileFromR2,
   getObjectSize,
 } from "@/utils/storage";
 import { forEachZipEntry, readStreamToBuffer } from "@/utils/zip/zipFile";
@@ -289,6 +290,8 @@ const streamAndProcessZip = async ({
   const cropsMeta: CropMeta[] = [];
   let processedImages = 0;
   let thumbnailKey: string | null = null;
+  let failedEntries = 0;
+  const failedEntryNames: string[] = [];
 
   try {
     await forEachZipEntry({
@@ -300,72 +303,90 @@ const streamAndProcessZip = async ({
         const processable = validateProcessableImageEntry(entryName);
         if (!processable) return;
 
-        const fileStream = await entry.openReadStream();
-        const fileBuffer = await readStreamToBuffer(fileStream);
-      const normalizedBuffer = await normalizeBufferTo1280x720(fileBuffer);
-      const cropBuffer = await cropSubtitleFromBuffer(normalizedBuffer);
+        try {
+          const fileStream = await entry.openReadStream();
+          const fileBuffer = await readStreamToBuffer(fileStream, {
+            expectedBytes: entry.uncompressedSize,
+            context: `entry="${entry.fileName}"`,
+          });
 
-      // Only include base images (1, 2, 3, etc.) in the final ZIP
-      // Skip decimal variants (1.1, 1.2, etc.) from the ZIP
-      // Use original image (raw) with original extension
-      if (processable.shouldIncludeInZip) {
-        // Extract original extension from originalName (e.g., "1.jpg" -> ".jpg")
-        const originalExt =
-          processable.originalName.match(/\.(png|jpe?g)$/i)?.[0] || ".png";
-        const zipFilename = `${processable.baseName}${originalExt}`;
-        archive.append(fileBuffer, { name: zipFilename });
-      }
+          const normalizedBuffer = await normalizeBufferTo1280x720(fileBuffer);
+          const cropBuffer = await cropSubtitleFromBuffer(normalizedBuffer);
 
-      // Create crop for ALL images (including 1.1, 1.2, etc.) for OCR processing
-      // Use original filename to preserve the relationship
-      const cropFilename = processable.originalName.replace(
-        /\.(png|jpe?g)$/i,
-        ".png"
-      );
-      const cropKey = getJobCropKey(userId, jobId, cropFilename);
-      await uploadBufferToObject({
-        key: cropKey,
-        body: cropBuffer,
-        contentType: "image/png",
-      });
+          // Only include base images (1, 2, 3, etc.) in the final ZIP
+          // Skip decimal variants (1.1, 1.2, etc.) from the ZIP
+          // Use original image (raw) with original extension
+          if (processable.shouldIncludeInZip) {
+            // Extract original extension from originalName (e.g., "1.jpg" -> ".jpg")
+            const originalExt =
+              processable.originalName.match(/\.(png|jpe?g)$/i)?.[0] || ".png";
+            const zipFilename = `${processable.baseName}${originalExt}`;
+            archive.append(fileBuffer, { name: zipFilename });
+          }
 
-      const signedCropUrl = await createSignedDownloadUrlWithTtl({
-        key: cropKey,
-        responseContentType: "image/png",
-        downloadFilename: cropFilename,
-        ttlSeconds: CROP_SIGNED_URL_TTL_SECONDS,
-      });
+          // Create crop for ALL images (including 1.1, 1.2, etc.) for OCR processing
+          // Use original filename to preserve the relationship
+          const cropFilename = processable.originalName.replace(
+            /\.(png|jpe?g)$/i,
+            ".png"
+          );
+          const cropKey = getJobCropKey(userId, jobId, cropFilename);
+          await uploadBufferToObject({
+            key: cropKey,
+            body: cropBuffer,
+            contentType: "image/png",
+          });
 
-      cropsMeta.push({
-        filename: cropFilename,
-        cropKey,
-        cropSignedUrl: signedCropUrl.url,
-      });
+          const signedCropUrl = await createSignedDownloadUrlWithTtl({
+            key: cropKey,
+            responseContentType: "image/png",
+            downloadFilename: cropFilename,
+            ttlSeconds: CROP_SIGNED_URL_TTL_SECONDS,
+          });
 
-      if (!thumbnailKey) {
-        const thumbnailBuffer = await createThumbnailFromBuffer(normalizedBuffer);
-        const thumbKey = getJobThumbnailKey(userId, jobId);
-        await uploadBufferToObject({
-          key: thumbKey,
-          body: thumbnailBuffer,
-          contentType: "image/jpeg",
-          cacheControl: "public, max-age=31536000, immutable",
-        });
-        thumbnailKey = thumbKey;
-      }
+          cropsMeta.push({
+            filename: cropFilename,
+            cropKey,
+            cropSignedUrl: signedCropUrl.url,
+          });
 
-      processedImages += 1;
-      if (onPreprocessProgress && processedImages % 50 === 0) {
-        await onPreprocessProgress(processedImages);
-      }
+          if (!thumbnailKey) {
+            const thumbnailBuffer =
+              await createThumbnailFromBuffer(normalizedBuffer);
+            const thumbKey = getJobThumbnailKey(userId, jobId);
+            await uploadBufferToObject({
+              key: thumbKey,
+              body: thumbnailBuffer,
+              contentType: "image/jpeg",
+              cacheControl: "public, max-age=31536000, immutable",
+            });
+            thumbnailKey = thumbKey;
+          }
+
+          processedImages += 1;
+          if (onPreprocessProgress && processedImages % 50 === 0) {
+            await onPreprocessProgress(processedImages);
+          }
+        } catch (err) {
+          failedEntries += 1;
+          if (failedEntryNames.length < 20) {
+            failedEntryNames.push(entry.fileName);
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(
+            `[zip-entry] skipping corrupt entry jobId=${jobId} entry="${entry.fileName}" uncompressedSize=${entry.uncompressedSize}: ${msg}`
+          );
+          // Best-effort: continue processing remaining entries.
+          return;
+        }
       },
     });
   } catch (err) {
     const sizeBytes = await getObjectSize(zipKey).catch(() => null);
     throw new Error(
-      `Failed to stream ZIP entries from R2. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}. ` +
-        "This indicates the ZIP is truncated/corrupt. If the ZIP was uploaded via multipart, ensure each part PUT is raw bytes (not multipart/form-data) " +
-        "and that all parts are uploaded before completing the multipart upload.",
+      `Failed to iterate ZIP entries from spooled temp file. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}, tempPath="${tempPath}". ` +
+        "This means the ZIP could not be read/iterated reliably (bad ZIP structure or I/O issue). " +
+        "If you are using multipart uploads, verify all parts are present and completion happened only after all bytes were uploaded.",
       { cause: err }
     );
   } finally {
@@ -376,6 +397,14 @@ const streamAndProcessZip = async ({
       await fs.unlink(tempPath).catch(() => undefined);
     }
     release();
+  }
+
+  if (failedEntries > 0) {
+    console.warn(
+      `[zip-entry] jobId=${jobId} skippedEntries=${failedEntries} examples=${failedEntryNames.join(
+        ", "
+      )}`
+    );
   }
 
   await archive.finalize();
@@ -417,38 +446,23 @@ const chunkArray = <T>(array: T[], chunkSize: number): T[][] => {
 
 // Solo cuenta cuántas imágenes procesables hay en el ZIP (sin descargar contenido)
 const countProcessableImagesInZip = async (zipKey: string): Promise<number> => {
-  const { tempPath, release } = await downloadObjectToTempFileVerified({
+  return withTempFileFromR2({
     key: zipKey,
     prefix: "count",
+    fn: async (tempPath) => {
+      let total = 0;
+      await forEachZipEntry({
+        filePath: tempPath,
+        onEntry: async (entry) => {
+          if (entry.isDirectory) return;
+          const entryName = entry.fileName;
+          const processable = validateProcessableImageEntry(entryName);
+          if (processable) total += 1;
+        },
+      });
+      return total;
+    },
   });
-  let total = 0;
-  try {
-    await forEachZipEntry({
-      filePath: tempPath,
-      onEntry: async (entry) => {
-        if (entry.isDirectory) return;
-        const entryName = entry.fileName;
-        const processable = validateProcessableImageEntry(entryName);
-        if (processable) total += 1;
-      },
-    });
-  } catch (err) {
-    const sizeBytes = await getObjectSize(zipKey).catch(() => null);
-    throw new Error(
-      `Failed to parse ZIP from R2. key="${zipKey}", sizeBytes=${sizeBytes ?? "unknown"}. ` +
-        "If you recently switched to multipart uploads, verify each part PUT uploads raw bytes (Blob.slice/ArrayBuffer) and not multipart/form-data, " +
-        "and that the upload completes with all parts present.",
-      { cause: err }
-    );
-  } finally {
-    if (env.R2_SPOOL_KEEP_FILES_ON_ERROR) {
-      console.warn(`[zip-spool] keeping temp zip for inspection: ${tempPath}`);
-    } else {
-      await fs.unlink(tempPath).catch(() => undefined);
-    }
-    release();
-  }
-  return total;
 };
 
 const createBatchArtifacts = async ({

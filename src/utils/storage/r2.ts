@@ -362,6 +362,31 @@ export const downloadObjectToTempFileVerified = async (params: {
   throw new Error("Failed to spool ZIP to temp file.");
 };
 
+export const withTempFileFromR2 = async <T>(params: {
+  key: string;
+  prefix: string;
+  fn: (tempPath: string) => Promise<T>;
+}): Promise<T> => {
+  const { tempPath, release } = await downloadObjectToTempFileVerified({
+    key: params.key,
+    prefix: params.prefix,
+  });
+
+  let succeeded = false;
+  try {
+    const result = await params.fn(tempPath);
+    succeeded = true;
+    return result;
+  } finally {
+    if (!succeeded && env.R2_SPOOL_KEEP_FILES_ON_ERROR) {
+      console.warn(`[zip-spool] keeping temp file for inspection: ${tempPath}`);
+    } else {
+      await fsPromises.unlink(tempPath).catch(() => undefined);
+    }
+    release();
+  }
+};
+
 /**
  * Resumable streaming download for very large objects.
  *
