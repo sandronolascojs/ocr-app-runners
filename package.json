@@ -9,7 +9,9 @@
     "build": "tsup",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [
     "inngest",
@@ -49,6 +51,8 @@
   },
   "packageManager": "pnpm@10.9.0",
   "devDependencies": {
-    "@types/yauzl": "2.10.3"
+    "@types/yauzl": "2.10.3",
+    "vite-tsconfig-paths": "6.0.3",
+    "vitest": "4.0.16"
   }
 }

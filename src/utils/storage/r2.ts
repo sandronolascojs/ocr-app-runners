@@ -273,22 +273,26 @@ const safeUnlink = async (filePath: string): Promise<void> => {
   }
 };
 
-export const downloadObjectToTempFileVerified = async (params: {
-  key: string;
-  prefix?: string;
-}): Promise<{ tempPath: string; sizeBytes: number; release: () => void }> => {
-  const sizeBytes = await getObjectSize(params.key);
+// Exported for tests to inject a fake S3 client.
+export const downloadObjectToTempFileVerifiedWithClient = async (
+  client: { send: (command: unknown) => Promise<{ Body?: unknown }> },
+  params: { key: string; prefix?: string },
+  deps?: {
+    getSize?: (key: string) => Promise<number | null>;
+    acquire?: (bytes: number) => Promise<{ release: () => void }>;
+  }
+): Promise<{ tempPath: string; sizeBytes: number; release: () => void }> => {
+  const getSize = deps?.getSize ?? getObjectSize;
+  const acquire = deps?.acquire ?? acquireZipSpool;
+
+  const sizeBytes = await getSize(params.key);
   if (typeof sizeBytes !== "number" || sizeBytes <= 0) {
     throw new Error(
       `Cannot spool ZIP: missing/invalid Content-Length for key="${params.key}".`
     );
   }
 
-  const lease = await acquireZipSpool(sizeBytes);
-  const snap = getZipSpoolSnapshot();
-  console.log(
-    `[zip-spool] acquired bytes=${sizeBytes} inUseBytes=${snap.inUseBytes}/${snap.budgetBytes} inFlight=${snap.inFlight} queued=${snap.queued}`
-  );
+  const lease = await acquire(sizeBytes);
 
   const filename = `${params.prefix ?? "zip"}-${randomId()}.zip`;
   const tempPath = path.join(os.tmpdir(), filename);
@@ -297,7 +301,7 @@ export const downloadObjectToTempFileVerified = async (params: {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     let written = 0;
     try {
-      const response = await r2Client.send(
+      const response = await client.send(
         new GetObjectCommand({
           Bucket: env.CLOUDFLARE_R2_BUCKET_NAME,
           Key: params.key,
@@ -324,7 +328,6 @@ export const downloadObjectToTempFileVerified = async (params: {
         );
       }
 
-      // quick sanity: file exists and matches size
       const st = await fsPromises.stat(tempPath);
       if (st.size !== sizeBytes) {
         throw new Error(
@@ -335,19 +338,9 @@ export const downloadObjectToTempFileVerified = async (params: {
       return {
         tempPath,
         sizeBytes,
-        release: () => {
-          lease.release();
-          const s = getZipSpoolSnapshot();
-          console.log(
-            `[zip-spool] released bytes=${sizeBytes} inUseBytes=${s.inUseBytes}/${s.budgetBytes} inFlight=${s.inFlight} queued=${s.queued}`
-          );
-        },
+        release: () => lease.release(),
       };
     } catch (error) {
-      console.warn(
-        `[zip-spool] download attempt ${attempt}/${maxAttempts} failed key="${params.key}" expected=${sizeBytes} written=${written}:`,
-        error instanceof Error ? error.message : error
-      );
       await safeUnlink(tempPath);
       if (attempt === maxAttempts) {
         lease.release();
@@ -357,9 +350,46 @@ export const downloadObjectToTempFileVerified = async (params: {
     }
   }
 
-  // unreachable
   lease.release();
   throw new Error("Failed to spool ZIP to temp file.");
+};
+
+export const downloadObjectToTempFileVerified = async (params: {
+  key: string;
+  prefix?: string;
+}): Promise<{ tempPath: string; sizeBytes: number; release: () => void }> => {
+  const sizeBytes = await getObjectSize(params.key);
+  if (typeof sizeBytes !== "number" || sizeBytes <= 0) {
+    throw new Error(
+      `Cannot spool ZIP: missing/invalid Content-Length for key="${params.key}".`
+    );
+  }
+
+  const lease = await acquireZipSpool(sizeBytes);
+  const snap = getZipSpoolSnapshot();
+  console.log(
+    `[zip-spool] acquired bytes=${sizeBytes} inUseBytes=${snap.inUseBytes}/${snap.budgetBytes} inFlight=${snap.inFlight} queued=${snap.queued}`
+  );
+
+  const result = await downloadObjectToTempFileVerifiedWithClient(
+    r2Client as unknown as { send: (command: unknown) => Promise<{ Body?: unknown }> },
+    params,
+    {
+      getSize: async () => sizeBytes,
+      acquire: async () => lease,
+    }
+  );
+
+  return {
+    ...result,
+    release: () => {
+      lease.release();
+      const s = getZipSpoolSnapshot();
+      console.log(
+        `[zip-spool] released bytes=${sizeBytes} inUseBytes=${s.inUseBytes}/${s.budgetBytes} inFlight=${s.inFlight} queued=${s.queued}`
+      );
+    },
+  };
 };
 
 export const withTempFileFromR2 = async <T>(params: {

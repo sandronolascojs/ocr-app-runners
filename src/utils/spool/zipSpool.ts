@@ -93,6 +93,21 @@ const singleton = new ZipSpoolManager({
   maxConcurrency: env.R2_SPOOL_MAX_CONCURRENCY,
 });
 
+// Exported for tests (pure behavior).
+export const createZipSpoolManagerForTest = (params: {
+  budgetGb: number;
+  maxConcurrency: number;
+}): {
+  acquire: (bytes: number) => Promise<SpoolLease>;
+  getSnapshot: () => ReturnType<ZipSpoolManager["getSnapshot"]>;
+} => {
+  const mgr = new ZipSpoolManager(params);
+  return {
+    acquire: (bytes) => mgr.acquire(bytes),
+    getSnapshot: () => mgr.getSnapshot(),
+  };
+};
+
 export const acquireZipSpool = async (bytes: number): Promise<SpoolLease> => {
   return singleton.acquire(bytes);
 };

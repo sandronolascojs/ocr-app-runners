@@ -59,8 +59,8 @@ import { forEachZipEntry, readStreamToBuffer } from "@/utils/zip/zipFile";
 import { env } from "@/config/env.config";
 
 const BATCH_SLEEP_INTERVAL = "20s";
-const BATCH_SIZE = 500; // Reduced from 1000 to avoid token limit errors
-const BATCH_SIZE_REDUCTION_STEPS = [500, 400, 300, 200, 100, 50]; // Tamaños de batch a probar cuando hay error de token limit
+const BATCH_SIZE = 450; // Reduced from 1000 to avoid token limit errors
+const BATCH_SIZE_REDUCTION_STEPS = [400, 300, 200, 100, 50]; // Tamaños de batch a probar cuando hay error de token limit
 
 type CropMeta = {
   filename: string;
@@ -113,11 +113,11 @@ type ProcessedBatchResult = {
   batchId: string;
   batchOutputFileId: string;
   batchIndex: number;
-};
-
-type PersistedProcessedBatch = ProcessedBatchResult & {
+  startIndex: number;
   itemsCount: number;
 };
+
+type PersistedProcessedBatch = ProcessedBatchResult;
 
 type PersistableFrame = {
   jobId: string;
@@ -282,13 +282,30 @@ const loadProcessedBatches = (jobId: string): PersistedProcessedBatch[] => {
     const raw = fsSync.readFileSync(filePath, "utf8");
     const data = JSON.parse(raw) as PersistedProcessedBatch[];
     if (!Array.isArray(data)) return [];
-    return data.filter(
-      (entry) =>
+    const filtered = data.filter((entry) => {
+      return (
         typeof entry.batchIndex === "number" &&
         typeof entry.batchId === "string" &&
         typeof entry.batchOutputFileId === "string" &&
         typeof entry.itemsCount === "number"
-    );
+      );
+    });
+
+    // Backwards-compat: older persisted entries may not have startIndex.
+    // Reconstruct sequentially from itemsCount (best-effort) to support retries.
+    const sorted = [...filtered].sort((a, b) => a.batchIndex - b.batchIndex);
+    let cursor = 0;
+    return sorted.map((entry) => {
+      const startIndex =
+        typeof (entry as { startIndex?: unknown }).startIndex === "number"
+          ? (entry as { startIndex: number }).startIndex
+          : cursor;
+      cursor = startIndex + entry.itemsCount;
+      return {
+        ...entry,
+        startIndex,
+      };
+    });
   } catch (error) {
     console.warn(
       `[retry] Failed to load processedBatches.json; proceeding without cached batches. ${error instanceof Error ? error.message : String(error)}`
@@ -683,39 +700,89 @@ const checkBatchStatus = async ({
 }): Promise<{
   status: string;
   outputFileId: string | null;
+  errorFileId: string | null;
+  failureReason: string | null;
 }> => {
   const latestBatch = await openai.batches.retrieve(batchId);
+
+  // The SDK type surface can vary across versions. Pull failure info defensively.
+  const failureReason =
+    (latestBatch as unknown as { status_details?: { error?: { message?: string } } })
+      .status_details?.error?.message ??
+    (latestBatch as unknown as { last_error?: { message?: string } }).last_error
+      ?.message ??
+    null;
 
   return {
     status: latestBatch.status,
     outputFileId: latestBatch.output_file_id as string | null,
+    errorFileId: (latestBatch as unknown as { error_file_id?: string | null })
+      .error_file_id ?? null,
+    failureReason,
   };
+};
+
+const isTokenLimitFailure = (message: string): boolean => {
+  return (
+    message.includes("Enqueued token limit") ||
+    message.includes("token limit reached") ||
+    message.includes("enqueued tokens") ||
+    message.toLowerCase().includes("enqueued token")
+  );
+};
+
+const getBatchFailureMessage = async (params: {
+  openai: OpenAI;
+  errorFileId: string | null;
+  failureReason: string | null;
+}): Promise<string> => {
+  if (params.failureReason) return params.failureReason;
+  if (!params.errorFileId) return "";
+  try {
+    const stream = await params.openai.files.content(params.errorFileId);
+    const buf = Buffer.from(await stream.arrayBuffer());
+    const text = buf.toString("utf8");
+    // Error file can be JSONL; grab the first meaningful line.
+    const first = text
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.length > 0);
+    return first ?? text.slice(0, 500);
+  } catch {
+    return "";
+  }
 };
 
 const saveBatchResults = async ({
   jobId,
   processedBatches,
-  totalImages,
   openai,
   cropUrlMap,
   cropsMeta,
 }: {
   jobId: string;
   processedBatches: ProcessedBatchResult[];
-  totalImages: number;
   openai: OpenAI;
   cropUrlMap: CropMetaMap;
   cropsMeta: CropMeta[];
 }): Promise<number> => {
-  const framesToPersist: PersistableFrame[] = [];
+  const frameMap = new Map<string, PersistableFrame>();
   let totalProcessedLines = 0;
   const failedItems: Array<{ customId: string; filename: string }> = [];
-  const expectedEntries: ExpectedEntry[] = cropsMeta.map((c, idx) => ({
-    customId: `job-${jobId}-batch-${Math.floor(idx / BATCH_SIZE)}-frame-${idx}-${c.filename}`,
-    filename: c.filename,
-    index: idx,
-    url: c.cropSignedUrl,
-  }));
+  const expectedEntries: ExpectedEntry[] = [];
+  for (const batch of processedBatches) {
+    for (let local = 0; local < batch.itemsCount; local += 1) {
+      const index = batch.startIndex + local;
+      const crop = cropsMeta[index];
+      if (!crop) continue;
+      expectedEntries.push({
+        customId: `job-${jobId}-batch-${batch.batchIndex}-frame-${index}-${crop.filename}`,
+        filename: crop.filename,
+        index,
+        url: crop.cropSignedUrl,
+      });
+    }
+  }
   const expectedMap = new Map(expectedEntries.map((e) => [e.customId, e]));
   const seen = new Set<string>();
 
@@ -786,7 +853,7 @@ const saveBatchResults = async ({
             });
             
             // Include failed items in count with empty text - retry will attempt to get real text
-            framesToPersist.push({
+            frameMap.set(`${parsedId.index}:${parsedId.filename}`, {
               jobId,
               filename: parsedId.filename,
               baseKey: getBaseKeyFromFilename(parsedId.filename),
@@ -822,7 +889,7 @@ const saveBatchResults = async ({
       // Convert <EMPTY> or empty strings to empty string to ensure all frames are included
       const finalText = (!text || text === "<EMPTY>") ? "" : text;
 
-      framesToPersist.push({
+      frameMap.set(`${index}:${filename}`, {
         jobId,
         filename,
         baseKey: getBaseKeyFromFilename(filename),
@@ -846,27 +913,50 @@ const saveBatchResults = async ({
     }
   }
 
-  // Retry failed + missing items una vez, en un mini batch
-  const retryItems = [
-    ...failedItems.map((f) => ({ ...f, index: expectedMap.get(f.customId)?.index ?? 0 })),
+  // Retry failed + missing items with multiple passes (smaller batches each time).
+  const initialRetryItems = [
+    ...failedItems.map((f) => ({
+      customId: f.customId,
+      filename: f.filename,
+      index: expectedMap.get(f.customId)?.index ?? 0,
+    })),
     ...missingItems,
   ];
 
-  if (retryItems.length) {
-    const retryJsonlPath = getJobBatchJsonlPath(jobId, processedBatches.length) + "-retry";
+  const retryPassSizes = [100, 50, 20, 10];
+  let pending = Array.from(
+    new Map(initialRetryItems.map((i) => [i.customId, i])).values()
+  );
+
+  const waitForBatchOutput = async (batchId: string): Promise<string> => {
+    for (let attempt = 0; attempt < 120; attempt++) {
+      const latest = await openai.batches.retrieve(batchId);
+      if (latest.status === "completed" && latest.output_file_id) {
+        return latest.output_file_id as string;
+      }
+      if (latest.status === "failed" || latest.status === "cancelled") {
+        throw new Error(`Retry batch failed with status=${latest.status}`);
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    throw new Error("Retry batch did not complete in time");
+  };
+
+  const runRetryBatch = async (
+    items: Array<{ customId: string; filename: string; index: number }>,
+    pass: number,
+    batchNo: number
+  ): Promise<Set<string>> => {
+    const retryJsonlPath =
+      getJobBatchJsonlPath(jobId, processedBatches.length) + `-retry-${pass}-${batchNo}`;
     const jsonlStream = fsSync.createWriteStream(retryJsonlPath, {
       encoding: "utf8",
     });
 
-    const seenRetry = new Set<string>();
-    for (const item of retryItems) {
-      if (seenRetry.has(item.customId)) continue;
-      seenRetry.add(item.customId);
-
+    for (const item of items) {
       const imageUrl = cropUrlMap[item.filename] || expectedMap.get(item.customId)?.url;
-      if (!imageUrl) {
-        continue;
-      }
+      if (!imageUrl) continue;
+
       const line = {
         custom_id: item.customId,
         method: "POST",
@@ -880,10 +970,7 @@ const saveBatchResults = async ({
               role: "user",
               content: [
                 { type: "text", text: AI_CONSTANTS.PROMPTS.OCR },
-                {
-                  type: "image_url",
-                  image_url: { url: imageUrl },
-                },
+                { type: "image_url", image_url: { url: imageUrl } },
               ],
             },
           ],
@@ -909,25 +996,8 @@ const saveBatchResults = async ({
       completion_window: "24h",
     });
 
-    // Poll simple
-    const waitSimple = async (): Promise<string> => {
-      for (let attempt = 0; attempt < 120; attempt++) {
-        const latest = await openai.batches.retrieve(batch.id);
-        if (latest.status === "completed" && latest.output_file_id) {
-          return latest.output_file_id as string;
-        }
-        if (latest.status === "failed" || latest.status === "cancelled") {
-          throw new Error(`Retry batch failed with status=${latest.status}`);
-        }
-        await new Promise((r) => setTimeout(r, 5000));
-      }
-      throw new Error("Retry batch did not complete in time");
-    };
-
-    const retryOutputFileId = await waitSimple();
-
-    // Parse retry output
-    const outputStream = await openai.files.content(retryOutputFileId);
+    const outputFileId = await waitForBatchOutput(batch.id);
+    const outputStream = await openai.files.content(outputFileId);
     const outputBuffer = Buffer.from(await outputStream.arrayBuffer());
     const outputJsonl = outputBuffer.toString("utf8");
     const lines = outputJsonl
@@ -935,83 +1005,84 @@ const saveBatchResults = async ({
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
 
+    const succeeded = new Set<string>();
+
     for (const line of lines) {
       let parsed: {
         custom_id?: string;
         error?: { message?: string; code?: string };
         response?: {
-          body?: {
-            choices?: Array<{
-              message?: { content?: ChatCompletionContent };
-            }>;
-          };
+          body?: { choices?: Array<{ message?: { content?: ChatCompletionContent } }> };
         };
       };
       try {
-        parsed = JSON.parse(line) as {
-          custom_id?: string;
-          error?: { message?: string; code?: string };
-          response?: {
-            body?: {
-              choices?: Array<{
-                message?: { content?: ChatCompletionContent };
-              }>;
-            };
-          };
-        };
-      } catch (error) {
+        parsed = JSON.parse(line) as typeof parsed;
+      } catch {
         continue;
       }
+      if (parsed.error) continue;
+      if (!parsed.custom_id) continue;
 
-      if (parsed.error) {
-        continue;
-      }
+      const parsedId = parseCustomId(parsed.custom_id);
+      if (!parsedId) continue;
 
-      const customId = parsed.custom_id;
-      if (!customId) {
-        continue;
-      }
-      const parsedId = parseCustomId(customId);
-      if (!parsedId) {
-        continue;
-      }
-
-      const completion =
-        parsed.response?.body?.choices?.[0]?.message?.content;
+      const completion = parsed.response?.body?.choices?.[0]?.message?.content;
       const text = extractTextFromCompletion(completion);
+      const finalText = !text || text === "<EMPTY>" ? "" : text;
 
-      // Include ALL responses, even if empty - don't skip any frames
-      // Convert <EMPTY> or empty strings to empty string to ensure all frames are included
-      const finalText = (!text || text === "<EMPTY>") ? "" : text;
+      frameMap.set(`${parsedId.index}:${parsedId.filename}`, {
+        jobId,
+        filename: parsedId.filename,
+        baseKey: getBaseKeyFromFilename(parsedId.filename),
+        index: parsedId.index,
+        text: finalText,
+      });
+      succeeded.add(parsed.custom_id);
+    }
 
-      // Update existing frame if it exists (from failed items), otherwise add new one
-      const existingFrameIndex = framesToPersist.findIndex(
-        (f) => f.index === parsedId.index && f.filename === parsedId.filename
-      );
-      
-      if (existingFrameIndex >= 0) {
-        // Update existing frame with retry result
-        framesToPersist[existingFrameIndex].text = finalText;
-      } else {
-        // Add new frame if it doesn't exist
-        framesToPersist.push({
-          jobId,
-          filename: parsedId.filename,
-          baseKey: getBaseKeyFromFilename(parsedId.filename),
-          index: parsedId.index,
-          text: finalText,
-        });
-        totalProcessedLines += 1;
+    return succeeded;
+  };
+
+  for (let pass = 0; pass < retryPassSizes.length && pending.length > 0; pass += 1) {
+    const size = retryPassSizes[pass]!;
+    const nextPending: typeof pending = [];
+    let batchNo = 0;
+
+    for (let i = 0; i < pending.length; i += size) {
+      const slice = pending.slice(i, i + size);
+      try {
+        const succeeded = await runRetryBatch(slice, pass, batchNo);
+        for (const item of slice) {
+          if (!succeeded.has(item.customId)) {
+            nextPending.push(item);
+          }
+        }
+      } catch (err) {
+        // If the retry batch fails, keep all items for the next (smaller) pass.
+        nextPending.push(...slice);
+      } finally {
+        batchNo += 1;
       }
+    }
+
+    pending = nextPending;
+  }
+
+  // Ensure we have one frame per expected entry; any remaining missing get empty text.
+  for (const entry of expectedEntries) {
+    const key = `${entry.index}:${entry.filename}`;
+    if (!frameMap.has(key)) {
+      frameMap.set(key, {
+        jobId,
+        filename: entry.filename,
+        baseKey: getBaseKeyFromFilename(entry.filename),
+        index: entry.index,
+        text: "",
+      });
     }
   }
 
-  if (totalImages > 0 && totalProcessedLines !== totalImages) {
-    throw new Error(
-      `Batch output mismatch: expected ${totalImages} responses but got ${totalProcessedLines} across ${processedBatches.length} batches.`
-    );
-  }
-
+  const framesToPersist = Array.from(frameMap.values());
   if (!framesToPersist.length) {
     throw new Error(
       `No OCR frames were parsed from the batch outputs (${processedBatches.length} batches).`
@@ -1526,10 +1597,12 @@ export const processOcrJob = inngest.createFunction(
           0
         );
         const processedBatches: ProcessedBatchResult[] = cachedProcessedBatches.map(
-          ({ batchId, batchOutputFileId, batchIndex }) => ({
+          ({ batchId, batchOutputFileId, batchIndex, startIndex, itemsCount }) => ({
             batchId,
             batchOutputFileId,
             batchIndex,
+            startIndex,
+            itemsCount,
           })
         );
         const persistedProcessedBatches: PersistedProcessedBatch[] = [...cachedProcessedBatches];
@@ -1567,11 +1640,18 @@ export const processOcrJob = inngest.createFunction(
             `Creating batch ${batchIndex + 1}/${totalBatches} for job ${jobId} (images ${globalStartIndex + 1}-${globalStartIndex + chunk.length}) with batch size ${currentBatchSize}`
           );
 
-          // Try to create batch with retry logic for token limit errors
-          // Wrap the entire retry logic in step.run for idempotency
-          const artifacts = await step.run(
-            `${OcrStepId.CreateAndAwaitBatch}-${batchIndex}`,
-            async () => {
+          let batchOutputFileId: string | null = null;
+          let lastBatchId: string | null = null;
+          let enqueueRetry = 0;
+
+          // Token limit can happen after the batch is created (status flips to failed).
+          // In that case we backoff + shrink batch size and re-create a new batch with a new step id.
+          while (true) {
+            // Try to create batch with retry logic for token limit errors
+            // Wrap the entire retry logic in step.run for idempotency
+            const artifacts = await step.run(
+              `${OcrStepId.CreateAndAwaitBatch}-${batchIndex}-enqueueRetry-${enqueueRetry}`,
+              async () => {
               let result: BatchArtifacts | null = null;
               let retryAttempt = 0;
               let localBatchSize = currentBatchSize;
@@ -1691,67 +1771,111 @@ export const processOcrJob = inngest.createFunction(
 
               return result;
             }
-          );
-
-          if (!artifacts || !artifacts.batchId) {
-            throw new Error(
-              `Batch ID missing after creation for batch ${batchIndex}.`
-            );
-          }
-
-          // Use current chunk size (may have been reduced)
-          progress.submittedImages += chunk.length;
-          await persistProgress(jobId, progress);
-
-          console.log(
-            `Waiting for batch ${batchIndex + 1}/${totalBatches} (batchId: ${artifacts.batchId}) to complete for job ${jobId}`
-          );
-
-          // Wait for this batch to complete before processing the next one
-          // This ensures we don't exceed OpenAI rate limits and process sequentially
-          // Use separate steps for each check to allow proper sleep handling
-          let batchOutputFileId: string | null = null;
-          let attempt = 0;
-
-          while (true) {
-            const batchStatus = await step.run(
-              `${OcrStepId.WaitBatchCompletion}-${batchIndex}-${attempt}`,
-              () =>
-                checkBatchStatus({
-                  batchId: artifacts.batchId,
-                  openai,
-                })
             );
 
-            if (
-              batchStatus.status === "completed" &&
-              batchStatus.outputFileId
-            ) {
-              batchOutputFileId = batchStatus.outputFileId;
-              break;
-            }
-
-            if (
-              batchStatus.status === "failed" ||
-              batchStatus.status === "cancelled"
-            ) {
+            if (!artifacts || !artifacts.batchId) {
               throw new Error(
-                `Batch ${batchIndex} failed with status=${batchStatus.status}`
+                `Batch ID missing after creation for batch ${batchIndex}.`
               );
             }
+            lastBatchId = artifacts.batchId;
 
-            // Sleep before next check - this must be outside step.run
-            await step.sleep(
-              `${OcrSleepId.WaitBatchCompletion}-${jobId}-${batchIndex}-${attempt}`,
-              BATCH_SLEEP_INTERVAL
-            );
-            attempt += 1;
-          }
+            // Use current chunk size (may have been reduced)
+            progress.submittedImages += chunk.length;
+            await persistProgress(jobId, progress);
 
-          if (!batchOutputFileId) {
-            throw new Error(
-              `Batch ${batchIndex} completed but output file ID is missing`
+            console.log(
+              `Waiting for batch ${batchIndex + 1}/${totalBatches} (batchId: ${artifacts.batchId}) to complete for job ${jobId}`
             );
+
+            // Wait for this batch to complete before processing the next one
+            // This ensures we don't exceed OpenAI rate limits and process sequentially
+            // Use separate steps for each check to allow proper sleep handling
+            let attempt = 0;
+
+            while (true) {
+              const batchStatus = await step.run(
+                `${OcrStepId.WaitBatchCompletion}-${batchIndex}-enqueueRetry-${enqueueRetry}-${attempt}`,
+                () =>
+                  checkBatchStatus({
+                    batchId: artifacts.batchId,
+                    openai,
+                  })
+              );
+
+              if (
+                batchStatus.status === "completed" &&
+                batchStatus.outputFileId
+              ) {
+                batchOutputFileId = batchStatus.outputFileId;
+                break;
+              }
+
+              if (
+                batchStatus.status === "failed" ||
+                batchStatus.status === "cancelled"
+              ) {
+                const failureMessage = await getBatchFailureMessage({
+                  openai,
+                  errorFileId: batchStatus.errorFileId,
+                  failureReason: batchStatus.failureReason,
+                });
+
+                if (failureMessage && isTokenLimitFailure(failureMessage)) {
+                  const idx = BATCH_SIZE_REDUCTION_STEPS.indexOf(currentBatchSize);
+                  const nextBatchSize =
+                    idx >= 0 && idx < BATCH_SIZE_REDUCTION_STEPS.length - 1
+                      ? BATCH_SIZE_REDUCTION_STEPS[idx + 1]!
+                      : currentBatchSize;
+
+                  console.warn(
+                    `[token-limit] Batch failed after creation. jobId=${jobId} batchIndex=${batchIndex} status=${batchStatus.status} ` +
+                      `currentBatchSize=${currentBatchSize} nextBatchSize=${nextBatchSize} enqueueRetry=${enqueueRetry} ` +
+                      `message="${failureMessage}"`
+                  );
+
+                  // Backoff a bit to let other in-progress batches complete and free enqueued tokens.
+                  await step.sleep(
+                    `${OcrSleepId.WaitBatchCompletion}-${jobId}-${batchIndex}-tokenLimitBackoff-${enqueueRetry}`,
+                    "60s"
+                  );
+
+                  // If we can shrink, do it and re-chunk the remaining items from the current cursor.
+                  if (nextBatchSize !== currentBatchSize) {
+                    currentBatchSize = nextBatchSize;
+                  }
+                  const remaining = cropsMeta.slice(processedItemsCount);
+                  cropsChunks = chunkArray(remaining, currentBatchSize);
+                  totalBatches = processedBatches.length + cropsChunks.length;
+                  progress.totalBatches = totalBatches;
+                  await persistProgress(jobId, progress);
+
+                  // Restart from the first chunk of remaining items with a new batch creation step id.
+                  pendingIndex = 0;
+                  batchOutputFileId = null;
+                  enqueueRetry += 1;
+                  break;
+                }
+
+                throw new Error(
+                  `Batch ${batchIndex} failed with status=${batchStatus.status}. outputFileId=${batchStatus.outputFileId ?? "null"} errorFileId=${batchStatus.errorFileId ?? "null"} reason="${failureMessage || batchStatus.failureReason || "unknown"}"`
+                );
+              }
+
+              // Sleep before next check - this must be outside step.run
+              await step.sleep(
+                `${OcrSleepId.WaitBatchCompletion}-${jobId}-${batchIndex}-enqueueRetry-${enqueueRetry}-${attempt}`,
+                BATCH_SLEEP_INTERVAL
+              );
+              attempt += 1;
+            }
+
+            // If we broke out due to token-limit retry, restart create/wait.
+            if (!batchOutputFileId) {
+              continue;
+            }
+
+            break;
           }
 
           progress.batchesCompleted += 1;
@@ -1762,14 +1886,15 @@ export const processOcrJob = inngest.createFunction(
           );
 
           const processedBatch: ProcessedBatchResult = {
-            batchId: artifacts.batchId,
+            batchId: lastBatchId ?? "unknown",
             batchOutputFileId,
             batchIndex,
+            startIndex: globalStartIndex,
+            itemsCount: chunk.length,
           };
           processedBatches.push(processedBatch);
           persistedProcessedBatches.push({
             ...processedBatch,
-            itemsCount: chunk.length,
           });
           await persistProcessedBatches(
             jobId,
@@ -1803,7 +1928,6 @@ export const processOcrJob = inngest.createFunction(
           saveBatchResults({
             jobId,
             processedBatches,
-            totalImages,
             openai,
             cropUrlMap,
             cropsMeta,
