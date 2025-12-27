@@ -6,6 +6,7 @@ import { Transform } from "node:stream";
 import { inngest } from "@/inngest/client";
 import { db } from "@/db";
 import { ocrJobs, ocrJobFrames, ocrJobItems } from "@/db/schema";
+import type { SelectOcrJob } from "@/db/schema/jobs";
 import { eq, and } from "drizzle-orm";
 import {
   validateProcessableImageEntry,
@@ -65,6 +66,7 @@ type CropMeta = {
   filename: string;
   cropKey: string;
   cropSignedUrl: string;
+  signedAt?: string;
 };
 
 type CropMetaMap = Record<string, string>;
@@ -113,6 +115,10 @@ type ProcessedBatchResult = {
   batchIndex: number;
 };
 
+type PersistedProcessedBatch = ProcessedBatchResult & {
+  itemsCount: number;
+};
+
 type PersistableFrame = {
   jobId: string;
   filename: string;
@@ -122,6 +128,8 @@ type PersistableFrame = {
 };
 
 const CROP_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24; // 24 hours
+const CROP_SIGNED_URL_EXPIRY_SAFETY_SECONDS = 5 * 60; // refresh 5 minutes before expiry
+const cropSignedUrlTtlSeconds = env.CROP_SIGNED_URL_TTL_SECONDS ?? CROP_SIGNED_URL_TTL_SECONDS;
 
 type JobItemMeta = {
   storageKey: string;
@@ -250,6 +258,86 @@ const createJobItem = async ({
   }
 };
 
+const parseIsoOrNull = (value?: string): number | null => {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+};
+
+const hasExpired = (signedAt?: string): boolean => {
+  const parsed = parseIsoOrNull(signedAt);
+  if (parsed === null) return true;
+  const ageSeconds = (Date.now() - parsed) / 1000;
+  return ageSeconds >= cropSignedUrlTtlSeconds - CROP_SIGNED_URL_EXPIRY_SAFETY_SECONDS;
+};
+
+const getProcessedBatchesPath = (jobId: string): string =>
+  path.join(getJobCropsDir(jobId), "processedBatches.json");
+
+const loadProcessedBatches = (jobId: string): PersistedProcessedBatch[] => {
+  const filePath = getProcessedBatchesPath(jobId);
+  if (!fsSync.existsSync(filePath)) return [];
+
+  try {
+    const raw = fsSync.readFileSync(filePath, "utf8");
+    const data = JSON.parse(raw) as PersistedProcessedBatch[];
+    if (!Array.isArray(data)) return [];
+    return data.filter(
+      (entry) =>
+        typeof entry.batchIndex === "number" &&
+        typeof entry.batchId === "string" &&
+        typeof entry.batchOutputFileId === "string" &&
+        typeof entry.itemsCount === "number"
+    );
+  } catch (error) {
+    console.warn(
+      `[retry] Failed to load processedBatches.json; proceeding without cached batches. ${error instanceof Error ? error.message : String(error)}`
+    );
+    return [];
+  }
+};
+
+const persistProcessedBatches = async (
+  jobId: string,
+  batches: PersistedProcessedBatch[]
+): Promise<void> => {
+  const filePath = getProcessedBatchesPath(jobId);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(batches, null, 2), "utf8");
+};
+
+const refreshCropSignedUrls = async ({
+  cropsMeta,
+}: {
+  cropsMeta: CropMeta[];
+}): Promise<CropMeta[]> => {
+  const refreshedAt = new Date().toISOString();
+
+  const refreshed = await Promise.all(
+    cropsMeta.map(async (crop) => {
+      if (!crop.cropKey) {
+        throw new Error(`Missing cropKey for crop filename="${crop.filename}"`);
+      }
+
+      const signed = await createSignedDownloadUrlWithTtl({
+        key: crop.cropKey,
+        responseContentType: "image/png",
+        downloadFilename: crop.filename,
+        ttlSeconds: cropSignedUrlTtlSeconds,
+      });
+
+      return {
+        ...crop,
+        cropSignedUrl: signed.url,
+        signedAt: refreshedAt,
+      };
+    })
+  );
+
+  // Keep deterministic order to avoid unstable retries
+  return [...refreshed].sort((a, b) => compareImageFilenames(a.filename, b.filename));
+};
+
 const streamAndProcessZip = async ({
   userId,
   jobId,
@@ -341,13 +429,14 @@ const streamAndProcessZip = async ({
             key: cropKey,
             responseContentType: "image/png",
             downloadFilename: cropFilename,
-            ttlSeconds: CROP_SIGNED_URL_TTL_SECONDS,
+            ttlSeconds: cropSignedUrlTtlSeconds,
           });
 
           cropsMeta.push({
             filename: cropFilename,
             cropKey,
             cropSignedUrl: signedCropUrl.url,
+            signedAt: new Date().toISOString(),
           });
 
           if (!thumbnailKey) {
@@ -1158,6 +1247,9 @@ export const processOcrJob = inngest.createFunction(
     docxKey: string;
     rawZipKey: string | null;
   }> => {
+    let job: SelectOcrJob | null = null;
+    let currentStep: JobStep | null = null;
+
     const { jobId, zipKey, userId } = event.data as {
       jobId: string;
       zipKey: string;
@@ -1189,18 +1281,19 @@ export const processOcrJob = inngest.createFunction(
       // Get user's OpenAI client
       const openai = await getUserOpenAIClient(userId);
 
-      const [job] = await db
+      const [jobRow] = await db
         .select()
         .from(ocrJobs)
         .where(eq(ocrJobs.jobId, jobId))
         .limit(1);
+      job = jobRow ?? null;
 
       let progress = buildProgress({
-        totalImages: job.totalImages ?? 0,
-        processedImages: job.processedImages ?? 0,
-        submittedImages: job.submittedImages ?? 0,
-        totalBatches: job.totalBatches ?? 0,
-        batchesCompleted: job.batchesCompleted ?? 0,
+        totalImages: job?.totalImages ?? 0,
+        processedImages: job?.processedImages ?? 0,
+        submittedImages: job?.submittedImages ?? 0,
+        totalBatches: job?.totalBatches ?? 0,
+        batchesCompleted: job?.batchesCompleted ?? 0,
       });
 
       if (!job) {
@@ -1269,7 +1362,7 @@ export const processOcrJob = inngest.createFunction(
       }
 
       // Estado actual en memoria (se irá actualizando manualmente)
-      let currentStep: JobStep = job.step ?? JobStep.PREPROCESSING;
+      currentStep = job.step ?? JobStep.PREPROCESSING;
       let totalImages = job.totalImages ?? 0;
 
       const workspacePaths = buildWorkspacePaths(jobId);
@@ -1392,6 +1485,30 @@ export const processOcrJob = inngest.createFunction(
       if (!cropsMeta.length) {
         throw new Error("No crops were generated from the provided ZIP file.");
       }
+
+      if (cropsMeta.some((c) => !c.cropKey)) {
+        throw new Error("cropsMeta is missing cropKey for at least one entry; cannot resume safely.");
+      }
+
+      // If signed URLs are stale, refresh them so resumed batches don't fail.
+      if (cropsMeta.some((c) => hasExpired(c.signedAt))) {
+        console.log(
+          `[retry] Refreshing crop signed URLs for job ${jobId} (entries=${cropsMeta.length}, ttl=${cropSignedUrlTtlSeconds}s)`
+        );
+        const refreshed = await refreshCropSignedUrls({ cropsMeta });
+        await fs.writeFile(cropsMetaPath, JSON.stringify(refreshed, null, 2), "utf8");
+        cropsMeta.splice(0, cropsMeta.length, ...refreshed);
+      }
+
+      // Quick preflight: ensure at least one crop object exists in R2
+      const firstCrop = cropsMeta[0];
+      const firstCropSize = await getObjectSize(firstCrop.cropKey);
+      if (firstCropSize === null) {
+        throw new Error(
+          `Crops not found in storage for job ${jobId}. First missing key="${firstCrop.cropKey}". Upload may be incomplete; re-upload required.`
+        );
+      }
+
       const cropUrlMap: CropMetaMap = Object.fromEntries(
         cropsMeta.map((c) => [c.filename, c.cropSignedUrl])
       );
@@ -1400,26 +1517,54 @@ export const processOcrJob = inngest.createFunction(
       if (currentStep === JobStep.BATCH_SUBMITTED) {
         // Divide cropsMeta into chunks - start with default BATCH_SIZE
         let currentBatchSize = BATCH_SIZE;
-        let cropsChunks = chunkArray(cropsMeta, currentBatchSize);
-        const processedBatches: ProcessedBatchResult[] = [];
-        let totalBatches = cropsChunks.length;
-        let batchIndex = 0;
-        let processedItemsCount = 0;
+
+        const cachedProcessedBatches = loadProcessedBatches(jobId).sort(
+          (a, b) => a.batchIndex - b.batchIndex
+        );
+        const processedItemsCountInitial = cachedProcessedBatches.reduce(
+          (sum, batch) => sum + batch.itemsCount,
+          0
+        );
+        const processedBatches: ProcessedBatchResult[] = cachedProcessedBatches.map(
+          ({ batchId, batchOutputFileId, batchIndex }) => ({
+            batchId,
+            batchOutputFileId,
+            batchIndex,
+          })
+        );
+        const persistedProcessedBatches: PersistedProcessedBatch[] = [...cachedProcessedBatches];
+
+        const remainingCrops = cropsMeta.slice(processedItemsCountInitial);
+        let cropsChunks = chunkArray(remainingCrops, currentBatchSize);
+
+        let totalBatches = processedBatches.length + cropsChunks.length;
+        let processedItemsCount = processedItemsCountInitial;
 
         progress.totalBatches = totalBatches;
+        progress.batchesCompleted = Math.max(progress.batchesCompleted ?? 0, processedBatches.length);
+        progress.submittedImages = Math.max(progress.submittedImages ?? 0, processedItemsCount);
         await persistProgress(jobId, progress);
+
+        if (processedBatches.length > 0) {
+          console.log(
+            `[retry] Reusing ${processedBatches.length} completed batch(es) for job ${jobId}; processedItems=${processedItemsCount}`
+          );
+        }
 
         console.log(
           `Processing ${totalImages} images in ${totalBatches} batches of ${currentBatchSize} images each for job ${jobId}`
         );
 
-        // Process each batch chunk sequentially - wait for each batch to complete before starting the next
+        // Process each pending batch chunk sequentially - wait for each batch to complete before starting the next
         // Use while loop to handle dynamic re-chunking when batch size is reduced
-        while (batchIndex < cropsChunks.length) {
+        let pendingIndex = 0;
+        while (pendingIndex < cropsChunks.length) {
+          const batchIndex = processedBatches.length + pendingIndex;
+          const chunk = cropsChunks[pendingIndex];
           const globalStartIndex = processedItemsCount;
 
           console.log(
-            `Creating batch ${batchIndex + 1}/${totalBatches} for job ${jobId} (images ${globalStartIndex + 1}-${globalStartIndex + cropsChunks[batchIndex].length}) with batch size ${currentBatchSize}`
+            `Creating batch ${batchIndex + 1}/${totalBatches} for job ${jobId} (images ${globalStartIndex + 1}-${globalStartIndex + chunk.length}) with batch size ${currentBatchSize}`
           );
 
           // Try to create batch with retry logic for token limit errors
@@ -1514,7 +1659,7 @@ export const processOcrJob = inngest.createFunction(
               // Update the global state if batch size was reduced
               if (localBatchSize !== currentBatchSize) {
                 // Get the original chunk to see what items remain
-                const originalChunk = cropsChunks[batchIndex];
+                const originalChunk = cropsChunks[pendingIndex];
                 const processedInThisBatch = localChunk.length;
                 const remainingInOriginalChunk = originalChunk.slice(processedInThisBatch);
                 
@@ -1526,14 +1671,15 @@ export const processOcrJob = inngest.createFunction(
                 const newChunks = chunkArray(remainingCrops, localBatchSize);
 
                 // Replace chunks from current batchIndex onwards with the new smaller chunks
-                cropsChunks.splice(batchIndex, cropsChunks.length - batchIndex, ...newChunks);
+                cropsChunks.splice(pendingIndex, cropsChunks.length - pendingIndex, ...newChunks);
 
                 // Update current batch size for future batches
                 currentBatchSize = localBatchSize;
 
                 // Recalculate total batches
                 const remainingItems = cropsMeta.length - processedItemsCount - processedInThisBatch;
-                totalBatches = batchIndex + 1 + Math.ceil(remainingItems / localBatchSize);
+                totalBatches =
+                  processedBatches.length + pendingIndex + 1 + Math.ceil(remainingItems / localBatchSize);
 
                 progress.totalBatches = totalBatches;
                 await persistProgress(jobId, progress);
@@ -1553,8 +1699,8 @@ export const processOcrJob = inngest.createFunction(
             );
           }
 
-          // Use cropsChunks[batchIndex] to get the actual chunk size (may have been reduced)
-          progress.submittedImages += cropsChunks[batchIndex].length;
+          // Use current chunk size (may have been reduced)
+          progress.submittedImages += chunk.length;
           await persistProgress(jobId, progress);
 
           console.log(
@@ -1615,16 +1761,24 @@ export const processOcrJob = inngest.createFunction(
             `Batch ${batchIndex + 1}/${totalBatches} completed for job ${jobId}`
           );
 
-          processedBatches.push({
+          const processedBatch: ProcessedBatchResult = {
             batchId: artifacts.batchId,
             batchOutputFileId,
             batchIndex,
+          };
+          processedBatches.push(processedBatch);
+          persistedProcessedBatches.push({
+            ...processedBatch,
+            itemsCount: chunk.length,
           });
+          await persistProcessedBatches(
+            jobId,
+            persistedProcessedBatches
+          );
 
           // Update counters for next iteration
-          // Use cropsChunks[batchIndex] to get the actual chunk size (may have been reduced)
-          processedItemsCount += cropsChunks[batchIndex].length;
-          batchIndex += 1;
+          processedItemsCount += chunk.length;
+          pendingIndex += 1;
 
           // Update job with the last batch info (for tracking purposes)
           // Batch info is no longer stored in ocrJobs table
@@ -1694,17 +1848,18 @@ export const processOcrJob = inngest.createFunction(
         rawZipKey: finalRawZipKey,
       };
     } catch (err) {
-      console.error("processOcrJob failed", jobId, err);
-
       const errorMessage =
         err instanceof Error ? err.message : "Unknown error in OCR job";
+      const errorWithContext = `processOcrJob failed (jobId=${jobId}, step=${currentStep ?? job?.step ?? "unknown"}): ${errorMessage}`;
+
+      console.error(errorWithContext, err);
 
       // Guardar error y marcar job como ERROR; el retry lo relanza desde el step que quedó
       await db
         .update(ocrJobs)
         .set({
           status: JobsStatus.ERROR,
-          error: errorMessage,
+          error: errorWithContext,
         })
         .where(eq(ocrJobs.jobId, jobId));
 

@@ -11,6 +11,11 @@ export const env = createEnv({
     CLOUDFLARE_R2_SECRET_ACCESS_KEY: z.string(),
     CLOUDFLARE_R2_BUCKET_NAME: z.string(),
     CLOUDFLARE_R2_S3_ENDPOINT: z.url().optional(),
+    CROP_SIGNED_URL_TTL_SECONDS: z
+      .coerce.number()
+      .int()
+      .positive()
+      .default(60 * 60 * 24),
     R2_SIGNED_UPLOAD_TTL_SECONDS: z
       .coerce.number()
       .int()
