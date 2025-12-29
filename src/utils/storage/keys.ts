@@ -9,6 +9,10 @@ export const getJobZipKey = (userId: string, jobId: string) =>
 export const getJobRawArchiveKey = (userId: string, jobId: string) =>
   `${getJobRootKey(userId, jobId)}/raw-images.zip`;
 
+// OCR pipeline: final filtered ZIP (only 1,2,3... excluding 1.1,1.2...)
+export const getJobOriginalZipKey = (userId: string, jobId: string) =>
+  `${getJobRootKey(userId, jobId)}/original-images.zip`;
+
 export const getJobTxtKey = (userId: string, jobId: string) =>
   `${getJobRootKey(userId, jobId)}/document.txt`;
 

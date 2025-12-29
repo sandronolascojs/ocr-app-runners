@@ -1,0 +1,10 @@
+export enum OcrBatchStatus {
+  CREATED = "CREATED",
+  SUBMITTED = "SUBMITTED",
+  RUNNING = "RUNNING",
+  COMPLETED = "COMPLETED",
+  FAILED = "FAILED",
+  CANCELLED = "CANCELLED",
+}
+
+

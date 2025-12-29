@@ -4,10 +4,7 @@ import path from "node:path";
 import archiver from "archiver";
 import { Transform } from "node:stream";
 import { inngest } from "@/inngest/client";
-import { db } from "@/db";
-import { ocrJobs, ocrJobFrames, ocrJobItems } from "@/db/schema";
 import type { SelectOcrJob } from "@/db/schema/jobs";
-import { eq, and } from "drizzle-orm";
 import {
   validateProcessableImageEntry,
   getBaseKeyFromFilename,
@@ -36,13 +33,42 @@ import { JobsStatus } from "@/types";
 import { JobStep } from "@/types/enums/jobs/jobStep.enum";
 import { JobItemType } from "@/types/enums/jobs/jobItemType.enum";
 import { JobType } from "@/types/enums/jobs/jobType.enum";
+import { OcrBatchKind } from "@/types/enums/jobs/ocrBatchKind.enum";
+import { OcrBatchStatus } from "@/types/enums/jobs/ocrBatchStatus.enum";
+import { OcrCropStatus } from "@/types/enums/jobs/ocrCropStatus.enum";
 import { InngestEvents, OcrStepId, OcrSleepId } from "@/types/enums/inngest";
 import { getUserOpenAIClient } from "@/utils/openai-user";
 import type { OpenAI } from "openai";
 import { InngestFunctions } from "@/types/enums/inngest/inngestFunctions.enum";
 import { AI_CONSTANTS } from "@/constants/ai.constants";
 import {
-  MIN_BATCH_SIZE,
+  countCropsForJob,
+  deleteJobItemByType,
+  getCropsByIds,
+  getCropsForBatchRange,
+  getCropsForJob,
+  getFramesForJob,
+  getInFlightBatch,
+  getJobById,
+  getJobItemByType,
+  getJobItemMetaByType,
+  getLastBatchSummary,
+  getNextBatchNo,
+  getPendingCrops,
+  insertBatch,
+  persistProgress,
+  replaceCropsForJob,
+  updateBatch,
+  updateCropsFailedRetryable,
+  updateCropsStatus,
+  updateJob,
+  updateJobItemSizeByType,
+  upsertFrames,
+  upsertJobItem,
+  type OcrJobCropRow,
+  type PersistableFrame,
+} from "@/repositories/ocrJobRepository";
+import {
   INITIAL_BACKOFF_MS,
   MAX_BACKOFF_MS,
   adjustBatchSizeOnTokenError,
@@ -53,7 +79,7 @@ import {
 } from "./batchHelpers";
 import {
   getJobDocxKey,
-  getJobRawArchiveKey,
+  getJobOriginalZipKey,
   getJobTxtKey,
   getJobCropKey,
   getJobThumbnailKey,
@@ -64,27 +90,16 @@ import {
   downloadObjectToTempFileVerified,
   withTempFileFromR2,
   getObjectSize,
+  deleteObjectsByPrefix,
+  deleteObjectIfExists,
 } from "@/utils/storage";
 import { forEachZipEntry, readStreamToBuffer } from "@/utils/zip/zipFile";
 import { env } from "@/config/env.config";
 
 const BATCH_SLEEP_INTERVAL = "20s";
-const BATCH_SIZE = 400; // Reduced from 1000 to avoid token limit errors
+const BATCH_SIZE = AI_CONSTANTS.BATCH.DEFAULT_SIZE;
 
-type CropMeta = {
-  filename: string;
-  cropKey: string;
-  cropSignedUrl: string;
-  signedAt?: string;
-};
-
-type CropMetaMap = Record<string, string>;
-type ExpectedEntry = {
-  customId: string;
-  filename: string;
-  index: number;
-  url: string;
-};
+type JobCrop = OcrJobCropRow;
 
 type WorkspacePaths = {
   jobRootDir: string;
@@ -101,68 +116,20 @@ type WorkspacePaths = {
 type StorageKeys = {
   txtKey: string;
   docxKey: string;
-  rawZipKey: string;
+  originalZipKey: string;
 };
 
 type StreamingArtifacts = {
   totalImages: number;
-  rawZipKey: string | null;
-  rawZipSizeBytes: number | null;
+  originalZipKey: string | null;
+  originalZipSizeBytes: number | null;
   thumbnailKey: string | null;
-  cropsMetaPath: string;
+  crops: Array<Pick<JobCrop, "filename" | "baseKey" | "cropKey">>;
 };
 
-type BatchArtifacts = {
-  batchId: string;
-  batchInputFileId: string;
-  batchIndex: number;
-};
 
-type ProcessedBatchResult = {
-  batchId: string;
-  batchOutputFileId: string;
-  batchIndex: number;
-  startIndex: number;
-  itemsCount: number;
-};
-
-type PersistedProcessedBatch = ProcessedBatchResult;
-
-type PersistableFrame = {
-  jobId: string;
-  filename: string;
-  baseKey: string;
-  index: number;
-  text: string;
-};
-
-const CROP_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24; // 24 hours
-const CROP_SIGNED_URL_EXPIRY_SAFETY_SECONDS = 5 * 60; // refresh 5 minutes before expiry
-const cropSignedUrlTtlSeconds = env.CROP_SIGNED_URL_TTL_SECONDS ?? CROP_SIGNED_URL_TTL_SECONDS;
 const sleepMs = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
-
-type JobItemMeta = {
-  storageKey: string;
-  sizeBytes: number | null;
-};
-
-const getJobItemMetaByType = async (
-  jobId: string,
-  itemType: JobItemType
-): Promise<JobItemMeta | null> => {
-  const [item] = await db
-    .select({
-      storageKey: ocrJobItems.storageKey,
-      sizeBytes: ocrJobItems.sizeBytes,
-    })
-    .from(ocrJobItems)
-    .where(and(eq(ocrJobItems.jobId, jobId), eq(ocrJobItems.itemType, itemType)))
-    .limit(1);
-
-  if (!item?.storageKey) return null;
-  return { storageKey: item.storageKey, sizeBytes: item.sizeBytes ?? null };
-};
 
 const assertR2ObjectMatchesExpectedSize = async (params: {
   key: string;
@@ -189,220 +156,17 @@ const assertR2ObjectMatchesExpectedSize = async (params: {
   return actualSizeBytes;
 };
 
-/**
- * Helper function to get a job item by type
- */
-const getJobItemByType = async (
-  jobId: string,
-  itemType: JobItemType
-): Promise<string | null> => {
-  const [item] = await db
-    .select()
-    .from(ocrJobItems)
-    .where(
-      and(
-        eq(ocrJobItems.jobId, jobId),
-        eq(ocrJobItems.itemType, itemType)
-      )
-    )
-    .limit(1);
-  
-  return item?.storageKey ?? null;
-};
-
-/**
- * Helper function to create or update a job item in the database
- */
-const createJobItem = async ({
-  jobId,
-  itemType,
-  storageKey,
-  sizeBytes,
-  contentType,
-  parentItemId,
-}: {
-  jobId: string;
-  itemType: JobItemType;
-  storageKey: string;
-  sizeBytes?: number;
-  contentType?: string;
-  parentItemId?: string;
-}): Promise<string> => {
-  // Check if item already exists
-  const existing = await db
-    .select()
-    .from(ocrJobItems)
-    .where(
-      and(
-        eq(ocrJobItems.jobId, jobId),
-        eq(ocrJobItems.itemType, itemType)
-      )
-    )
-    .limit(1);
-
-  if (existing.length > 0) {
-    // Update existing item
-    await db
-      .update(ocrJobItems)
-      .set({
-        storageKey,
-        sizeBytes: sizeBytes ?? null,
-        contentType: contentType ?? null,
-        parentItemId: parentItemId ?? null,
-      })
-      .where(eq(ocrJobItems.ocrJobItemId, existing[0].ocrJobItemId));
-    return existing[0].ocrJobItemId;
-  } else {
-    // Create new item
-    const [newItem] = await db
-      .insert(ocrJobItems)
-      .values({
-        jobId,
-        itemType,
-        storageKey,
-        sizeBytes: sizeBytes ?? null,
-        contentType: contentType ?? null,
-        parentItemId: parentItemId ?? null,
-      })
-      .returning({ ocrJobItemId: ocrJobItems.ocrJobItemId });
-    return newItem.ocrJobItemId;
-  }
-};
-
-const parseIsoOrNull = (value?: string): number | null => {
-  if (!value) return null;
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? null : parsed;
-};
-
-const hasExpired = (signedAt?: string): boolean => {
-  const parsed = parseIsoOrNull(signedAt);
-  if (parsed === null) return true;
-  const ageSeconds = (Date.now() - parsed) / 1000;
-  return ageSeconds >= cropSignedUrlTtlSeconds - CROP_SIGNED_URL_EXPIRY_SAFETY_SECONDS;
-};
-
-const getProcessedBatchesPath = (jobId: string): string =>
-  path.join(getJobCropsDir(jobId), "processedBatches.json");
-
-const getBatchSizeHintPath = (jobId: string): string =>
-  path.join(getJobCropsDir(jobId), "batchSizeHint.json");
-
-const loadProcessedBatches = (jobId: string): PersistedProcessedBatch[] => {
-  const filePath = getProcessedBatchesPath(jobId);
-  if (!fsSync.existsSync(filePath)) return [];
-
-  try {
-    const raw = fsSync.readFileSync(filePath, "utf8");
-    const data = JSON.parse(raw) as PersistedProcessedBatch[];
-    if (!Array.isArray(data)) return [];
-    const filtered = data.filter((entry) => {
-      return (
-        typeof entry.batchIndex === "number" &&
-        typeof entry.batchId === "string" &&
-        typeof entry.batchOutputFileId === "string" &&
-        typeof entry.itemsCount === "number"
-      );
-    });
-
-    // Backwards-compat: older persisted entries may not have startIndex.
-    // Reconstruct sequentially from itemsCount (best-effort) to support retries.
-    const sorted = [...filtered].sort((a, b) => a.batchIndex - b.batchIndex);
-    let cursor = 0;
-    return sorted.map((entry) => {
-      const startIndex =
-        typeof (entry as { startIndex?: unknown }).startIndex === "number"
-          ? (entry as { startIndex: number }).startIndex
-          : cursor;
-      cursor = startIndex + entry.itemsCount;
-      return {
-        ...entry,
-        startIndex,
-      };
-    });
-  } catch (error) {
-    console.warn(
-      `[retry] Failed to load processedBatches.json; proceeding without cached batches. ${error instanceof Error ? error.message : String(error)}`
-    );
-    return [];
-  }
-};
-
-const persistProcessedBatches = async (
-  jobId: string,
-  batches: PersistedProcessedBatch[]
-): Promise<void> => {
-  const filePath = getProcessedBatchesPath(jobId);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(batches, null, 2), "utf8");
-};
-
-const loadBatchSizeHint = (jobId: string): number | null => {
-  const filePath = getBatchSizeHintPath(jobId);
-  if (!fsSync.existsSync(filePath)) return null;
-  try {
-    const raw = fsSync.readFileSync(filePath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (typeof parsed?.batchSize === "number" && parsed.batchSize > 0) {
-      return parsed.batchSize;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-};
-
-const persistBatchSizeHint = async (jobId: string, batchSize: number): Promise<void> => {
-  const filePath = getBatchSizeHintPath(jobId);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify({ batchSize }), "utf8");
-};
-
-const refreshCropSignedUrls = async ({
-  cropsMeta,
-}: {
-  cropsMeta: CropMeta[];
-}): Promise<CropMeta[]> => {
-  const refreshedAt = new Date().toISOString();
-
-  const refreshed = await Promise.all(
-    cropsMeta.map(async (crop) => {
-      if (!crop.cropKey) {
-        throw new Error(`Missing cropKey for crop filename="${crop.filename}"`);
-      }
-
-      const signed = await createSignedDownloadUrlWithTtl({
-        key: crop.cropKey,
-        responseContentType: "image/png",
-        downloadFilename: crop.filename,
-        ttlSeconds: cropSignedUrlTtlSeconds,
-      });
-
-      return {
-        ...crop,
-        cropSignedUrl: signed.url,
-        signedAt: refreshedAt,
-      };
-    })
-  );
-
-  // Keep deterministic order to avoid unstable retries
-  return [...refreshed].sort((a, b) => compareImageFilenames(a.filename, b.filename));
-};
-
 const streamAndProcessZip = async ({
   userId,
   jobId,
   zipKey,
   storageKeys,
-  cropsMetaPath,
   onPreprocessProgress,
 }: {
   userId: string;
   jobId: string;
   zipKey: string;
   storageKeys: StorageKeys;
-  cropsMetaPath: string;
   onPreprocessProgress?: (count: number) => Promise<void>;
 }): Promise<StreamingArtifacts> => {
   const { tempPath, release } = await downloadObjectToTempFileVerified({
@@ -422,12 +186,12 @@ const streamAndProcessZip = async ({
 
   const archiveOutput = archive.pipe(sizeCounter);
   const filteredZipUploadPromise = uploadStreamToObject({
-    key: storageKeys.rawZipKey,
+    key: storageKeys.originalZipKey,
     stream: archiveOutput,
     contentType: "application/zip",
   });
 
-  const cropsMeta: CropMeta[] = [];
+  const crops: Array<Pick<JobCrop, "filename" | "baseKey" | "cropKey">> = [];
   let processedImages = 0;
   let thumbnailKey: string | null = null;
   let failedEntries = 0;
@@ -477,18 +241,10 @@ const streamAndProcessZip = async ({
             contentType: "image/png",
           });
 
-          const signedCropUrl = await createSignedDownloadUrlWithTtl({
-            key: cropKey,
-            responseContentType: "image/png",
-            downloadFilename: cropFilename,
-            ttlSeconds: cropSignedUrlTtlSeconds,
-          });
-
-          cropsMeta.push({
+          crops.push({
             filename: cropFilename,
+            baseKey: getBaseKeyFromFilename(cropFilename),
             cropKey,
-            cropSignedUrl: signedCropUrl.url,
-            signedAt: new Date().toISOString(),
           });
 
           if (!thumbnailKey) {
@@ -551,38 +307,17 @@ const streamAndProcessZip = async ({
   await archive.finalize();
   await filteredZipUploadPromise;
 
-  const sortedCrops = [...cropsMeta].sort((a, b) => {
-    const comparison = compareImageFilenames(a.filename, b.filename);
-    if (comparison !== 0) {
-      return comparison;
-    }
-    return a.filename.localeCompare(b.filename);
-  });
-
-  await fs.writeFile(cropsMetaPath, JSON.stringify(sortedCrops), "utf8");
-
   if (onPreprocessProgress) {
     await onPreprocessProgress(processedImages);
   }
 
   return {
     totalImages: processedImages,
-    rawZipKey: processedImages > 0 ? storageKeys.rawZipKey : null,
-    rawZipSizeBytes: processedImages > 0 ? filteredZipSizeBytes : null,
+    originalZipKey: processedImages > 0 ? storageKeys.originalZipKey : null,
+    originalZipSizeBytes: processedImages > 0 ? filteredZipSizeBytes : null,
     thumbnailKey,
-    cropsMetaPath,
+    crops: [...crops].sort((a, b) => compareImageFilenames(a.filename, b.filename)),
   };
-};
-
-/**
- * Divides an array into chunks of specified size
- */
-const chunkArray = <T>(array: T[], chunkSize: number): T[][] => {
-  const chunks: T[][] = [];
-  for (let i = 0; i < array.length; i += chunkSize) {
-    chunks.push(array.slice(i, i + chunkSize));
-  }
-  return chunks;
 };
 
 // Solo cuenta cuántas imágenes procesables hay en el ZIP (sin descargar contenido)
@@ -606,44 +341,52 @@ const countProcessableImagesInZip = async (zipKey: string): Promise<number> => {
   });
 };
 
-const createBatchArtifacts = async ({
-  jobId,
-  cropsMeta,
-  batchIndex,
-  globalStartIndex,
-  openai,
-}: {
+const cropSignedUrlTtlSeconds = env.CROP_SIGNED_URL_TTL_SECONDS ?? 60 * 60 * 24;
+
+const buildCropCustomId = (cropId: string): string => `crop-${cropId}`;
+
+const parseCropIdFromCustomId = (customId: string): string | null => {
+  if (!customId.startsWith("crop-")) return null;
+  const id = customId.slice("crop-".length);
+  return id.length > 0 ? id : null;
+};
+
+type BatchOutputLine = {
+  custom_id?: string;
+  error?: { message?: string; code?: string };
+  response?: {
+    body?: {
+      choices?: Array<{
+        message?: { content?: ChatCompletionContent };
+      }>;
+    };
+  };
+};
+
+const createAndSubmitOpenAiBatch = async (params: {
   jobId: string;
-  cropsMeta: CropMeta[];
-  batchIndex: number;
-  globalStartIndex: number;
+  batchNo: number;
+  crops: JobCrop[];
   openai: OpenAI;
-}): Promise<BatchArtifacts> => {
-  if (!cropsMeta.length) {
-    throw new Error(
-      `No crops found for job ${jobId} batch ${batchIndex} when creating Batch artifacts.`
-    );
-  }
+}): Promise<{ inputFileId: string; batchId: string; jsonlPath: string }> => {
+  const jsonlPath = getJobBatchJsonlPath(params.jobId, params.batchNo);
+  const jsonlStream = fsSync.createWriteStream(jsonlPath, { encoding: "utf8" });
 
-  const batchJsonlPath = getJobBatchJsonlPath(jobId, batchIndex);
-  const jsonlStream = fsSync.createWriteStream(batchJsonlPath, {
-    encoding: "utf8",
-  });
-
-  // Register error handler immediately to catch errors from write() calls
   const streamPromise = new Promise<void>((resolve, reject) => {
     jsonlStream.on("error", (err) => reject(err));
     jsonlStream.on("finish", () => resolve());
   });
 
-  // Write all lines for this batch chunk
-  for (let localIndex = 0; localIndex < cropsMeta.length; localIndex++) {
-    const { filename, cropSignedUrl } = cropsMeta[localIndex];
-    const globalIndex = globalStartIndex + localIndex;
-    const customId = `job-${jobId}-batch-${batchIndex}-frame-${globalIndex}-${filename}`;
+  for (const crop of params.crops) {
+    const signed = await createSignedDownloadUrlWithTtl({
+      key: crop.cropKey,
+      responseContentType: "image/png",
+      downloadFilename: crop.filename,
+      ttlSeconds: cropSignedUrlTtlSeconds,
+    });
 
     const line = {
-      custom_id: customId,
+      custom_id: buildCropCustomId(crop.ocrJobCropId),
       method: "POST",
       url: "/v1/chat/completions",
       body: {
@@ -655,99 +398,48 @@ const createBatchArtifacts = async ({
             role: "user",
             content: [
               { type: "text", text: AI_CONSTANTS.PROMPTS.OCR },
-              {
-                type: "image_url",
-                image_url: { url: cropSignedUrl },
-              },
+              { type: "image_url", image_url: { url: signed.url } },
             ],
           },
         ],
       },
     };
-
-    jsonlStream.write(JSON.stringify(line) + "\n");
+    jsonlStream.write(`${JSON.stringify(line)}\n`);
   }
 
   jsonlStream.end();
   await streamPromise;
 
-  const inputFile = await openai.files.create({
-    file: fsSync.createReadStream(batchJsonlPath),
+  const inputFile = await params.openai.files.create({
+    file: fsSync.createReadStream(jsonlPath),
     purpose: "batch",
   });
 
-  try {
-    const batch = await openai.batches.create({
-      input_file_id: inputFile.id,
-      endpoint: "/v1/chat/completions",
-      completion_window: "24h",
-    });
+  const batch = await params.openai.batches.create({
+    input_file_id: inputFile.id,
+    endpoint: "/v1/chat/completions",
+    completion_window: "24h",
+  });
 
-    return {
-      batchId: batch.id,
-      batchInputFileId: inputFile.id,
-      batchIndex,
-    };
-  } catch (error) {
-    // Check if it's a token limit error
-    // OpenAI SDK errors can have different structures:
-    // - error.message (string)
-    // - error.error?.message (nested error object)
-    // - error.response?.data?.error?.message (HTTP response error)
-    let errorMessage = "";
-    
-    if (error instanceof Error) {
-      errorMessage = error.message;
-    } else if (typeof error === "object" && error !== null) {
-      // Check for nested error structures
-      const err = error as Record<string, unknown>;
-      errorMessage = 
-        (err.message as string) ||
-        (err.error as { message?: string } | undefined)?.message ||
-        (err.response as { data?: { error?: { message?: string } } } | undefined)?.data?.error?.message ||
-        String(error);
-    } else {
-      errorMessage = String(error);
-    }
-
-    const isTokenLimitError =
-      errorMessage.includes("Enqueued token limit") ||
-      errorMessage.includes("token limit reached") ||
-      errorMessage.includes("enqueued tokens") ||
-      errorMessage.toLowerCase().includes("enqueued token");
-
-    if (isTokenLimitError) {
-      // Re-throw with a special error type so we can handle it upstream
-      throw new Error(`TOKEN_LIMIT_ERROR:${errorMessage}`);
-    }
-
-    // Re-throw other errors as-is
-    throw error;
-  }
+  return { inputFileId: inputFile.id, batchId: batch.id, jsonlPath };
 };
 
-const checkBatchStatus = async ({
-  batchId,
-  openai,
-}: {
-  batchId: string;
+const getBatchStatus = async (params: {
   openai: OpenAI;
+  batchId: string;
 }): Promise<{
   status: string;
   outputFileId: string | null;
   errorFileId: string | null;
   failureReason: string | null;
 }> => {
-  const latestBatch = await openai.batches.retrieve(batchId);
-
-  // The SDK type surface can vary across versions. Pull failure info defensively.
+  const latestBatch = await params.openai.batches.retrieve(params.batchId);
   const failureReason =
     (latestBatch as unknown as { status_details?: { error?: { message?: string } } })
       .status_details?.error?.message ??
     (latestBatch as unknown as { last_error?: { message?: string } }).last_error
       ?.message ??
     null;
-
   return {
     status: latestBatch.status,
     outputFileId: latestBatch.output_file_id as string | null,
@@ -757,14 +449,11 @@ const checkBatchStatus = async ({
   };
 };
 
-const isTokenLimitFailure = (message: string): boolean => {
-  return (
-    message.includes("Enqueued token limit") ||
-    message.includes("token limit reached") ||
-    message.includes("enqueued tokens") ||
-    message.toLowerCase().includes("enqueued token")
-  );
-};
+const isTokenLimitFailure = (message: string): boolean =>
+  message.includes("Enqueued token limit") ||
+  message.includes("token limit reached") ||
+  message.includes("enqueued tokens") ||
+  message.toLowerCase().includes("enqueued token");
 
 const getBatchFailureMessage = async (params: {
   openai: OpenAI;
@@ -777,7 +466,6 @@ const getBatchFailureMessage = async (params: {
     const stream = await params.openai.files.content(params.errorFileId);
     const buf = Buffer.from(await stream.arrayBuffer());
     const text = buf.toString("utf8");
-    // Error file can be JSONL; grab the first meaningful line.
     const first = text
       .split("\n")
       .map((l) => l.trim())
@@ -788,382 +476,117 @@ const getBatchFailureMessage = async (params: {
   }
 };
 
-const saveBatchResults = async ({
-  jobId,
-  processedBatches,
-  openai,
-  cropUrlMap,
-  cropsMeta,
-}: {
+const parseBatchOutputAndPersist = async (params: {
   jobId: string;
-  processedBatches: ProcessedBatchResult[];
   openai: OpenAI;
-  cropUrlMap: CropMetaMap;
-  cropsMeta: CropMeta[];
-}): Promise<number> => {
-  const frameMap = new Map<string, PersistableFrame>();
-  let totalProcessedLines = 0;
-  const failedItems: Array<{ customId: string; filename: string }> = [];
-  const expectedEntries: ExpectedEntry[] = [];
-  for (const batch of processedBatches) {
-    for (let local = 0; local < batch.itemsCount; local += 1) {
-      const index = batch.startIndex + local;
-      const crop = cropsMeta[index];
-      if (!crop) continue;
-      expectedEntries.push({
-        customId: `job-${jobId}-batch-${batch.batchIndex}-frame-${index}-${crop.filename}`,
-        filename: crop.filename,
-        index,
-        url: crop.cropSignedUrl,
-      });
-    }
-  }
-  const expectedMap = new Map(expectedEntries.map((e) => [e.customId, e]));
+  outputFileId: string;
+  crops: JobCrop[];
+}): Promise<{ failedCropIds: string[]; processedCount: number }> => {
+  const cropById = new Map(params.crops.map((c) => [c.ocrJobCropId, c]));
+  const expected = new Set(params.crops.map((c) => c.ocrJobCropId));
   const seen = new Set<string>();
+  const succeeded = new Set<string>();
 
-  const parseCustomId = (customId: string) => {
-    const match = customId.match(/^job-(.+)-batch-(\d+)-frame-(\d+)-(.+)$/);
-    if (!match) return null;
-    const index = Number.parseInt(match[3], 10);
-    if (Number.isNaN(index)) return null;
-    const filename = match[4];
-    return { filename, index };
-  };
+  const outputStream = await params.openai.files.content(params.outputFileId);
+  const outputBuffer = Buffer.from(await outputStream.arrayBuffer());
+  const outputJsonl = outputBuffer.toString("utf8");
 
-  // Process each batch output file
-  for (const { batchOutputFileId, batchIndex } of processedBatches) {
-    const outputStream = await openai.files.content(batchOutputFileId);
-    const outputBuffer = Buffer.from(await outputStream.arrayBuffer());
-    const outputJsonl = outputBuffer.toString("utf8");
+  const lines = outputJsonl
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
 
-    const lines = outputJsonl
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-
-    if (!lines.length) {
-      throw new Error(
-        `Batch ${batchIndex} output file is empty for job ${jobId}.`
-      );
-    }
-
-    for (const line of lines) {
-      let parsed: {
-        custom_id?: string;
-        error?: { message?: string; code?: string };
-        response?: {
-          body?: {
-            choices?: Array<{
-              message?: { content?: ChatCompletionContent };
-            }>;
-          };
-        };
-      };
-
-      try {
-        parsed = JSON.parse(line) as {
-          custom_id?: string;
-          error?: { message?: string; code?: string };
-          response?: {
-            body?: {
-              choices?: Array<{
-                message?: { content?: ChatCompletionContent };
-              }>;
-            };
-          };
-        };
-      } catch (error) {
-        throw new Error(
-          `Invalid JSON line in batch ${batchIndex} output: ${(error as Error).message}`
-        );
-      }
-
-      if (parsed.error) {
-        if (parsed.custom_id) {
-          const parsedId = parseCustomId(parsed.custom_id);
-          if (parsedId) {
-            failedItems.push({
-              customId: parsed.custom_id,
-              filename: parsedId.filename,
-            });
-            
-            // Include failed items in count with empty text - retry will attempt to get real text
-            frameMap.set(`${parsedId.index}:${parsedId.filename}`, {
-              jobId,
-              filename: parsedId.filename,
-              baseKey: getBaseKeyFromFilename(parsedId.filename),
-              index: parsedId.index,
-              text: "",
-            });
-            seen.add(parsed.custom_id);
-            totalProcessedLines += 1;
-          }
-        }
-        continue;
-      }
-
-      const customId = parsed.custom_id;
-      if (!customId) {
-        continue;
-      }
-
-      // Updated regex to match new custom_id format: job-{jobId}-batch-{batchIndex}-frame-{globalIndex}-{filename}
-      const parsedId = parseCustomId(customId);
-      if (!parsedId) {
-        continue;
-      }
-
-      const { filename, index } = parsedId;
-      seen.add(customId);
-
-      const completion =
-        parsed.response?.body?.choices?.[0]?.message?.content;
-      const text = extractTextFromCompletion(completion);
-
-      // Include ALL responses, even if empty - don't skip any frames
-      // Convert <EMPTY> or empty strings to empty string to ensure all frames are included
-      const finalText = (!text || text === "<EMPTY>") ? "" : text;
-
-      frameMap.set(`${index}:${filename}`, {
-        jobId,
-        filename,
-        baseKey: getBaseKeyFromFilename(filename),
-        index,
-        text: finalText,
-      });
-
-      totalProcessedLines += 1;
-    }
+  if (!lines.length) {
+    throw new Error(`Batch output file is empty for job ${params.jobId}.`);
   }
 
-  // Determinar faltantes no vistos
-  const missingItems: Array<{ customId: string; filename: string; index: number }> = [];
-  for (const [customId, entry] of expectedMap.entries()) {
-    if (!seen.has(customId)) {
-      missingItems.push({
-        customId,
-        filename: entry.filename,
-        index: entry.index,
-      });
+  const frames: PersistableFrame[] = [];
+  const failed: Array<{ cropId: string; message: string }> = [];
+
+  for (const line of lines) {
+    let parsed: BatchOutputLine;
+    try {
+      parsed = JSON.parse(line) as BatchOutputLine;
+    } catch (error) {
+      throw new Error(`Invalid JSON line in batch output: ${(error as Error).message}`);
     }
-  }
 
-  // Retry failed + missing items with multiple passes (smaller batches each time).
-  const initialRetryItems = [
-    ...failedItems.map((f) => ({
-      customId: f.customId,
-      filename: f.filename,
-      index: expectedMap.get(f.customId)?.index ?? 0,
-    })),
-    ...missingItems,
-  ];
+    const cropId = parsed.custom_id ? parseCropIdFromCustomId(parsed.custom_id) : null;
+    if (!cropId || !expected.has(cropId)) continue;
+    seen.add(cropId);
 
-  const retryPassSizes = [100, 50, 20, 10];
-  let pending = Array.from(
-    new Map(initialRetryItems.map((i) => [i.customId, i])).values()
-  );
-
-  const waitForBatchOutput = async (batchId: string): Promise<string> => {
-    for (let attempt = 0; attempt < 120; attempt++) {
-      const latest = await openai.batches.retrieve(batchId);
-      if (latest.status === "completed" && latest.output_file_id) {
-        return latest.output_file_id as string;
-      }
-      if (latest.status === "failed" || latest.status === "cancelled") {
-        throw new Error(`Retry batch failed with status=${latest.status}`);
-      }
-      await new Promise((r) => setTimeout(r, 5000));
+    if (parsed.error) {
+      failed.push({ cropId, message: parsed.error.message ?? "Unknown item error" });
+      continue;
     }
-    throw new Error("Retry batch did not complete in time");
-  };
 
-  const runRetryBatch = async (
-    items: Array<{ customId: string; filename: string; index: number }>,
-    pass: number,
-    batchNo: number
-  ): Promise<Set<string>> => {
-    const retryJsonlPath =
-      getJobBatchJsonlPath(jobId, processedBatches.length) + `-retry-${pass}-${batchNo}`;
-    const jsonlStream = fsSync.createWriteStream(retryJsonlPath, {
-      encoding: "utf8",
+    const crop = cropById.get(cropId);
+    if (!crop) continue;
+
+    const completion = parsed.response?.body?.choices?.[0]?.message?.content;
+    const text = extractTextFromCompletion(completion);
+    const finalText = !text || text === "<EMPTY>" ? "" : text;
+
+    frames.push({
+      jobId: params.jobId,
+      filename: crop.filename,
+      baseKey: crop.baseKey,
+      index: crop.index,
+      text: finalText,
     });
-
-    for (const item of items) {
-      const imageUrl = cropUrlMap[item.filename] || expectedMap.get(item.customId)?.url;
-      if (!imageUrl) continue;
-
-      const line = {
-        custom_id: item.customId,
-        method: "POST",
-        url: "/v1/chat/completions",
-        body: {
-          model: AI_CONSTANTS.MODELS.OPENAI,
-          temperature: 0,
-          max_tokens: 1024,
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: AI_CONSTANTS.PROMPTS.OCR },
-                { type: "image_url", image_url: { url: imageUrl } },
-              ],
-            },
-          ],
-        },
-      };
-      jsonlStream.write(JSON.stringify(line) + "\n");
-    }
-
-    jsonlStream.end();
-    await new Promise<void>((resolve, reject) => {
-      jsonlStream.on("finish", () => resolve());
-      jsonlStream.on("error", (err) => reject(err));
-    });
-
-    const inputFile = await openai.files.create({
-      file: fsSync.createReadStream(retryJsonlPath),
-      purpose: "batch",
-    });
-
-    const batch = await openai.batches.create({
-      input_file_id: inputFile.id,
-      endpoint: "/v1/chat/completions",
-      completion_window: "24h",
-    });
-
-    const outputFileId = await waitForBatchOutput(batch.id);
-    const outputStream = await openai.files.content(outputFileId);
-    const outputBuffer = Buffer.from(await outputStream.arrayBuffer());
-    const outputJsonl = outputBuffer.toString("utf8");
-    const lines = outputJsonl
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-
-    const succeeded = new Set<string>();
-
-    for (const line of lines) {
-      let parsed: {
-        custom_id?: string;
-        error?: { message?: string; code?: string };
-        response?: {
-          body?: { choices?: Array<{ message?: { content?: ChatCompletionContent } }> };
-        };
-      };
-      try {
-        parsed = JSON.parse(line) as typeof parsed;
-      } catch {
-        continue;
-      }
-      if (parsed.error) continue;
-      if (!parsed.custom_id) continue;
-
-      const parsedId = parseCustomId(parsed.custom_id);
-      if (!parsedId) continue;
-
-      const completion = parsed.response?.body?.choices?.[0]?.message?.content;
-      const text = extractTextFromCompletion(completion);
-      const finalText = !text || text === "<EMPTY>" ? "" : text;
-
-      frameMap.set(`${parsedId.index}:${parsedId.filename}`, {
-        jobId,
-        filename: parsedId.filename,
-        baseKey: getBaseKeyFromFilename(parsedId.filename),
-        index: parsedId.index,
-        text: finalText,
-      });
-      succeeded.add(parsed.custom_id);
-    }
-
-    return succeeded;
-  };
-
-  for (let pass = 0; pass < retryPassSizes.length && pending.length > 0; pass += 1) {
-    const size = retryPassSizes[pass]!;
-    const nextPending: typeof pending = [];
-    let batchNo = 0;
-
-    for (let i = 0; i < pending.length; i += size) {
-      const slice = pending.slice(i, i + size);
-      try {
-        const succeeded = await runRetryBatch(slice, pass, batchNo);
-        for (const item of slice) {
-          if (!succeeded.has(item.customId)) {
-            nextPending.push(item);
-          }
-        }
-      } catch (err) {
-        // If the retry batch fails, keep all items for the next (smaller) pass.
-        nextPending.push(...slice);
-      } finally {
-        batchNo += 1;
-      }
-    }
-
-    pending = nextPending;
+    succeeded.add(cropId);
   }
 
-  // Ensure we have one frame per expected entry; any remaining missing get empty text.
-  for (const entry of expectedEntries) {
-    const key = `${entry.index}:${entry.filename}`;
-    if (!frameMap.has(key)) {
-      frameMap.set(key, {
-        jobId,
-        filename: entry.filename,
-        baseKey: getBaseKeyFromFilename(entry.filename),
-        index: entry.index,
-        text: "",
-      });
+  // Missing outputs are retryable failures.
+  for (const cropId of expected) {
+    if (!seen.has(cropId)) {
+      failed.push({ cropId, message: "Missing output line for crop in batch output" });
     }
   }
 
-  const framesToPersist = Array.from(frameMap.values());
-  if (!framesToPersist.length) {
-    throw new Error(
-      `No OCR frames were parsed from the batch outputs (${processedBatches.length} batches).`
-    );
+  await upsertFrames(frames);
+
+  const succeededIds = Array.from(succeeded);
+
+  if (succeededIds.length) {
+    await updateCropsStatus({
+      cropIds: succeededIds,
+      status: OcrCropStatus.PROCESSED,
+      lastError: null,
+    });
   }
 
-  await db.delete(ocrJobFrames).where(eq(ocrJobFrames.jobId, jobId));
-  await db.insert(ocrJobFrames).values(framesToPersist);
+  const failedIds = Array.from(new Set(failed.map((f) => f.cropId)));
+  if (failedIds.length) {
+    await updateCropsFailedRetryable(failed);
+  }
 
-  await db
-    .update(ocrJobs)
-    .set({ step: JobStep.DOCS_BUILT })
-    .where(eq(ocrJobs.jobId, jobId));
-
-  return totalProcessedLines;
+  return { failedCropIds: failedIds, processedCount: frames.length };
 };
 
 const buildDocuments = async ({
   jobId,
   paths,
   storageKeys,
-  totalImages,
 }: {
   jobId: string;
   paths: WorkspacePaths;
   storageKeys: StorageKeys;
-  totalImages: number;
 }): Promise<void> => {
-  const frames = await db
-    .select()
-    .from(ocrJobFrames)
-    .where(eq(ocrJobFrames.jobId, jobId));
+  const frames = await getFramesForJob(jobId);
 
   const paragraphs = buildParagraphsFromFrames(frames);
-  if (!paragraphs.length) {
-    throw new Error("Unable to build OCR paragraphs for this job.");
-  }
+  // If OCR produced no text at all, still generate empty artifacts (do not fail the job).
+  const safeParagraphs = paragraphs.length ? paragraphs : [""];
 
-  const paragraphsWithBlankLine = paragraphs.flatMap((paragraph, index) =>
-    index < paragraphs.length - 1 ? [paragraph, ""] : [paragraph]
+  const paragraphsWithBlankLine = safeParagraphs.flatMap((paragraph, index) =>
+    index < safeParagraphs.length - 1 ? [paragraph, ""] : [paragraph]
   );
 
   const txtContent = paragraphsWithBlankLine.join("\n");
 
   await fs.writeFile(paths.txtPath, txtContent, "utf8");
-  await writeDocxFromParagraphs(paragraphs, paths.docxPath);
+  await writeDocxFromParagraphs(safeParagraphs, paths.docxPath);
 
   // Calculate file sizes before uploading
   const txtStats = fsSync.statSync(paths.txtPath);
@@ -1183,7 +606,7 @@ const buildDocuments = async ({
   });
 
   // Create items for documents
-  await createJobItem({
+  await upsertJobItem({
     jobId,
     itemType: JobItemType.TXT_DOCUMENT,
     storageKey: storageKeys.txtKey,
@@ -1191,7 +614,7 @@ const buildDocuments = async ({
     contentType: "text/plain; charset=utf-8",
   });
 
-  await createJobItem({
+  await upsertJobItem({
     jobId,
     itemType: JobItemType.DOCX_DOCUMENT,
     storageKey: storageKeys.docxKey,
@@ -1201,12 +624,7 @@ const buildDocuments = async ({
   });
 
   // Update job status
-  await db
-    .update(ocrJobs)
-    .set({
-      status: JobsStatus.DONE,
-    })
-    .where(eq(ocrJobs.jobId, jobId));
+  await updateJob(jobId, { status: JobsStatus.DONE });
 
   const dirsToRemove = [paths.rawDir, paths.normalizedDir, paths.cropsDir];
   const filesToRemove = [
@@ -1217,28 +635,19 @@ const buildDocuments = async ({
     path.join(paths.cropsDir, "cropsMeta.json"),
   ];
 
-  // Remove all batch JSONL files (legacy and new batch-indexed files)
-  // Try to remove the legacy file first
+  // Remove all JSONL temp files for this job (prefix-based; supports resumable batchNo naming).
   try {
-    await fs.unlink(paths.batchJsonlPath);
+    const entries = await fs.readdir(VOLUME_DIRS.tmpBase);
+    const prefix = `${jobId}-ocr`;
+    await Promise.all(
+      entries
+        .filter((name) => name.startsWith(prefix) && name.endsWith(".jsonl"))
+        .map((name) =>
+          fs.unlink(path.join(VOLUME_DIRS.tmpBase, name)).catch(() => undefined)
+        )
+    );
   } catch {
     // ignore
-  }
-
-  // Remove all batch-indexed files
-  // Calculate the number of batches based on totalImages
-  const numberOfBatches = Math.ceil(totalImages / BATCH_SIZE);
-  // Add a buffer to ensure we clean up all files even if there's a slight mismatch
-  const maxBatchesToCheck = numberOfBatches + 10;
-  
-  for (let i = 0; i < maxBatchesToCheck; i++) {
-    try {
-      const batchPath = getJobBatchJsonlPath(jobId, i);
-      await fs.unlink(batchPath);
-    } catch {
-      // File doesn't exist or already removed, continue to next
-      // Don't break here as batches might not be sequential if there were errors
-    }
   }
 
   for (const file of filesToRemove) {
@@ -1275,7 +684,7 @@ const buildWorkspacePaths = (jobId: string): WorkspacePaths => ({
 const buildStorageKeys = (userId: string, jobId: string): StorageKeys => ({
   txtKey: getJobTxtKey(userId, jobId),
   docxKey: getJobDocxKey(userId, jobId),
-  rawZipKey: getJobRawArchiveKey(userId, jobId),
+  originalZipKey: getJobOriginalZipKey(userId, jobId),
 });
 
 const ensureWorkspaceLayout = async (paths: WorkspacePaths) => {
@@ -1304,37 +713,6 @@ const buildProgress = (overrides?: Partial<ProgressState>): ProgressState => ({
   batchesCompleted: 0,
   ...overrides,
 });
-
-const persistProgress = async (
-  jobId: string,
-  progress: ProgressState,
-  extra?: Record<string, unknown>
-) => {
-  // Filter out legacy fields that no longer exist in schema
-  const allowedFields = [
-    'step',
-    'status',
-    'error',
-  ];
-  
-  const filteredExtra = extra
-    ? Object.fromEntries(
-        Object.entries(extra).filter(([key]) => allowedFields.includes(key))
-      )
-    : {};
-
-  await db
-    .update(ocrJobs)
-    .set({
-      processedImages: progress.processedImages,
-      totalImages: progress.totalImages,
-      totalBatches: progress.totalBatches,
-      batchesCompleted: progress.batchesCompleted,
-      submittedImages: progress.submittedImages,
-      ...filteredExtra,
-    })
-    .where(eq(ocrJobs.jobId, jobId));
-};
 
 // --- Helpers de flujo ---
 
@@ -1366,13 +744,10 @@ export const processOcrJob = inngest.createFunction(
       console.error("UserId missing in event data", event.data);
       
       try {
-        await db
-          .update(ocrJobs)
-          .set({
-            status: JobsStatus.ERROR,
-            error: "UserId missing in event data",
-          })
-          .where(eq(ocrJobs.jobId, jobId));
+        await updateJob(jobId, {
+          status: JobsStatus.ERROR,
+          error: "UserId missing in event data",
+        });
       } catch (updateError) {
         console.error(
           `Failed to update job ${jobId} to ERROR state:`,
@@ -1387,12 +762,7 @@ export const processOcrJob = inngest.createFunction(
       // Get user's OpenAI client
       const openai = await getUserOpenAIClient(userId);
 
-      const [jobRow] = await db
-        .select()
-        .from(ocrJobs)
-        .where(eq(ocrJobs.jobId, jobId))
-        .limit(1);
-      job = jobRow ?? null;
+      job = await getJobById(jobId);
 
       let progress = buildProgress({
         totalImages: job?.totalImages ?? 0,
@@ -1415,56 +785,36 @@ export const processOcrJob = inngest.createFunction(
         return { jobId, txtKey: "", docxKey: "", rawZipKey: null };
       }
 
-      // Get original zip key from items or use provided zipKey
-      const originalZipKey = await getJobItemByType(jobId, JobItemType.ORIGINAL_ZIP);
-      const storageZipKey = zipKey ?? originalZipKey;
+      // RAW_ZIP = input zip (uploaded). The event zipKey is expected to be that input.
+      const existingRawZipKey = await getJobItemByType(jobId, JobItemType.RAW_ZIP);
+      const storageZipKey = zipKey ?? existingRawZipKey;
       if (!storageZipKey) {
         console.error("Zip key missing for job", jobId);
         return { jobId, txtKey: "", docxKey: "", rawZipKey: null };
       }
 
-      // Create item for original zip if it doesn't exist
-      const originalZipItem = await db
-        .select()
-        .from(ocrJobItems)
-        .where(
-          and(
-            eq(ocrJobItems.jobId, jobId),
-            eq(ocrJobItems.itemType, JobItemType.ORIGINAL_ZIP)
-          )
-        )
-        .limit(1);
-
-      if (originalZipItem.length === 0) {
-        await createJobItem({
-          jobId,
-          itemType: JobItemType.ORIGINAL_ZIP,
-          storageKey: storageZipKey,
-          contentType: "application/zip",
-        });
-      }
-
-      // Validate the source ZIP in R2 and persist its size (helps detect truncated/corrupt uploads early)
-      const originalZipMeta = await getJobItemMetaByType(
+      // Ensure RAW_ZIP item exists (input.zip)
+      await upsertJobItem({
         jobId,
-        JobItemType.ORIGINAL_ZIP
-      );
-      const actualOriginalZipSizeBytes = await assertR2ObjectMatchesExpectedSize({
-        key: storageZipKey,
-        expectedSizeBytes: originalZipMeta?.sizeBytes ?? null,
-        context: `job ${jobId} ORIGINAL_ZIP`,
+        itemType: JobItemType.RAW_ZIP,
+        storageKey: storageZipKey,
+        contentType: "application/zip",
       });
 
-      if (originalZipMeta && originalZipMeta.sizeBytes === null) {
-        await db
-          .update(ocrJobItems)
-          .set({ sizeBytes: actualOriginalZipSizeBytes })
-          .where(
-            and(
-              eq(ocrJobItems.jobId, jobId),
-              eq(ocrJobItems.itemType, JobItemType.ORIGINAL_ZIP)
-            )
-          );
+      // Validate the input ZIP in R2 and persist its size (helps detect truncated/corrupt uploads early)
+      const rawZipMeta = await getJobItemMetaByType(jobId, JobItemType.RAW_ZIP);
+      const actualRawZipSizeBytes = await assertR2ObjectMatchesExpectedSize({
+        key: storageZipKey,
+        expectedSizeBytes: rawZipMeta?.sizeBytes ?? null,
+        context: `job ${jobId} RAW_ZIP`,
+      });
+
+      if (rawZipMeta && rawZipMeta.sizeBytes === null) {
+        await updateJobItemSizeByType(
+          jobId,
+          JobItemType.RAW_ZIP,
+          actualRawZipSizeBytes
+        );
       }
 
       // Estado actual en memoria (se irá actualizando manualmente)
@@ -1473,467 +823,535 @@ export const processOcrJob = inngest.createFunction(
 
       const workspacePaths = buildWorkspacePaths(jobId);
       const storageKeys = buildStorageKeys(userId, jobId);
-      const cropsMetaPath = path.join(workspacePaths.cropsDir, "cropsMeta.json");
-      let rawZipKeyForJob: string | null = await getJobItemByType(jobId, JobItemType.RAW_ZIP);
+      const originalZipKeyForJob: string | null = await getJobItemByType(
+        jobId,
+        JobItemType.ORIGINAL_ZIP
+      );
 
       // If already completed, short-circuit (avoid reading missing temp files)
       if (job.step === JobStep.DOCS_BUILT || job.step === JobStep.RESULTS_SAVED) {
         const txtKey = await getJobItemByType(jobId, JobItemType.TXT_DOCUMENT);
         const docxKey = await getJobItemByType(jobId, JobItemType.DOCX_DOCUMENT);
+        const originalZipKey = await getJobItemByType(jobId, JobItemType.ORIGINAL_ZIP);
         
         if (txtKey && docxKey) {
           return {
             jobId,
             txtKey,
             docxKey,
-            rawZipKey: rawZipKeyForJob,
+            rawZipKey: originalZipKey,
           };
         }
       }
 
       await ensureWorkspaceLayout(workspacePaths);
 
-      // Paso 1: contar imágenes procesables antes de procesar
-      const countedImages = await step.run("count-images", () =>
-        countProcessableImagesInZip(storageZipKey)
-      );
-      totalImages = countedImages;
+      // --- PREPROCESS (idempotent) ---
+      // If we already have crops persisted and an ORIGINAL_ZIP, we can skip preprocessing.
+      const hasPreprocessed =
+        (await countCropsForJob(jobId)) > 0 && Boolean(originalZipKeyForJob);
 
-      progress = buildProgress({
-        totalImages,
-        processedImages: 0, // OCR completadas
-        submittedImages: 0,
-        totalBatches: 0,
-        batchesCompleted: 0,
-      });
+      if (!hasPreprocessed) {
+        // Count images quickly for progress visibility
+        const countedImages = await step.run("count-images", () =>
+          countProcessableImagesInZip(storageZipKey)
+        );
+        totalImages = countedImages;
 
-      await persistProgress(jobId, progress, {
-        step: JobStep.PREPROCESSING,
-        status: JobsStatus.PROCESSING,
-      });
+        progress = buildProgress({
+          totalImages,
+          processedImages: 0,
+          submittedImages: 0,
+          totalBatches: 0,
+          batchesCompleted: 0,
+        });
 
-      // Paso 2: preprocesar (crops, resize, zip filtrado)
-      const streamingResult = await step.run(
-        OcrStepId.PreprocessImagesAndCrops,
-        () =>
-          streamAndProcessZip({
-            userId,
+        await persistProgress(jobId, progress, {
+          step: JobStep.PREPROCESSING,
+          status: JobsStatus.PROCESSING,
+        });
+
+        const streamingResult = await step.run(
+          OcrStepId.PreprocessImagesAndCrops,
+          () =>
+            streamAndProcessZip({
+              userId,
+              jobId,
+              zipKey: storageZipKey,
+              storageKeys,
+              onPreprocessProgress: async (count) => {
+                progress.processedImages = count;
+                await persistProgress(jobId, progress, {
+                  step: JobStep.PREPROCESSING,
+                  status: JobsStatus.PROCESSING,
+                });
+              },
+            })
+        );
+
+        totalImages = streamingResult.totalImages;
+
+        // Persist crops (deterministic index order). If rerun, rebuild from scratch.
+        await replaceCropsForJob(
+          jobId,
+          streamingResult.crops.map((c, idx) => ({
+            index: idx,
+            filename: c.filename,
+            baseKey: c.baseKey,
+            cropKey: c.cropKey,
+            status: OcrCropStatus.UPLOADED,
+          }))
+        );
+
+        progress = buildProgress({
+          totalImages,
+          processedImages: totalImages,
+          submittedImages: 0,
+          totalBatches: 0,
+          batchesCompleted: 0,
+        });
+
+        await persistProgress(jobId, progress, {
+          step: JobStep.BATCH_SUBMITTED,
+          status: JobsStatus.PROCESSING,
+        });
+
+        // Create item for ORIGINAL_ZIP (final filtered zip) and thumbnail
+        let originalZipItemId: string | undefined;
+        if (streamingResult.originalZipKey) {
+          originalZipItemId = await upsertJobItem({
             jobId,
-            zipKey: storageZipKey,
-            storageKeys,
-            cropsMetaPath,
-            onPreprocessProgress: async (count) => {
-              // processedImages refleja avance de preprocesado (crops/resize)
-              progress.processedImages = count;
-              await persistProgress(jobId, progress, {
-                step: JobStep.PREPROCESSING,
-                status: JobsStatus.PROCESSING,
-              });
-            },
-          })
-      );
+            itemType: JobItemType.ORIGINAL_ZIP,
+            storageKey: streamingResult.originalZipKey,
+            sizeBytes: streamingResult.originalZipSizeBytes ?? undefined,
+            contentType: "application/zip",
+          });
+        }
 
-      totalImages = streamingResult.totalImages;
-      rawZipKeyForJob = streamingResult.rawZipKey;
-
-      progress = buildProgress({
-        totalImages,
-        processedImages: totalImages, // ya terminó preprocesado
-        submittedImages: 0,
-        totalBatches: 0,
-        batchesCompleted: 0,
-      });
-
-      await persistProgress(jobId, progress, {
-        step: JobStep.BATCH_SUBMITTED,
-        status: JobsStatus.PROCESSING,
-      });
-
-      // Create items for raw zip and thumbnail (thumbnail linked to raw zip)
-      let rawZipItemId: string | undefined;
-      if (streamingResult.rawZipKey) {
-        rawZipItemId = await createJobItem({
-          jobId,
-          itemType: JobItemType.RAW_ZIP,
-          storageKey: streamingResult.rawZipKey,
-          sizeBytes: streamingResult.rawZipSizeBytes ?? undefined,
-          contentType: "application/zip",
-        });
+        if (streamingResult.thumbnailKey && originalZipItemId) {
+          await upsertJobItem({
+            jobId,
+            itemType: JobItemType.THUMBNAIL,
+            storageKey: streamingResult.thumbnailKey,
+            contentType: "image/jpeg",
+            parentItemId: originalZipItemId,
+          });
+        }
       }
 
-      if (streamingResult.thumbnailKey && rawZipItemId) {
-        await createJobItem({
-          jobId,
-          itemType: JobItemType.THUMBNAIL,
-          storageKey: streamingResult.thumbnailKey,
-          contentType: "image/jpeg",
-          parentItemId: rawZipItemId,
-        });
+      // Load crops from DB for batching
+      const crops: JobCrop[] = await getCropsForJob(jobId);
+
+      if (!crops.length) {
+        throw new Error(`No crops found in DB for job ${jobId}. Preprocess may have failed.`);
       }
 
-      if (!fsSync.existsSync(cropsMetaPath)) {
-        console.warn(
-          `cropsMeta.json missing for job ${jobId}; assuming processing already completed or temp cleaned.`
-        );
-        const txtKey = await getJobItemByType(jobId, JobItemType.TXT_DOCUMENT);
-        const docxKey = await getJobItemByType(jobId, JobItemType.DOCX_DOCUMENT);
-        return {
-          jobId,
-          txtKey: txtKey ?? "",
-          docxKey: docxKey ?? "",
-          rawZipKey: rawZipKeyForJob,
-        };
-      }
-
-      const cropsMeta: CropMeta[] = JSON.parse(
-        fsSync.readFileSync(cropsMetaPath, "utf8")
-      ) as CropMeta[];
-      if (!cropsMeta.length) {
-        throw new Error("No crops were generated from the provided ZIP file.");
-      }
-
-      if (cropsMeta.some((c) => !c.cropKey)) {
-        throw new Error("cropsMeta is missing cropKey for at least one entry; cannot resume safely.");
-      }
-
-      // If signed URLs are stale, refresh them so resumed batches don't fail.
-      if (cropsMeta.some((c) => hasExpired(c.signedAt))) {
-        console.log(
-          `[retry] Refreshing crop signed URLs for job ${jobId} (entries=${cropsMeta.length}, ttl=${cropSignedUrlTtlSeconds}s)`
-        );
-        const refreshed = await refreshCropSignedUrls({ cropsMeta });
-        await fs.writeFile(cropsMetaPath, JSON.stringify(refreshed, null, 2), "utf8");
-        cropsMeta.splice(0, cropsMeta.length, ...refreshed);
-      }
-
-      // Quick preflight: ensure at least one crop object exists in R2
-      const firstCrop = cropsMeta[0];
-      const firstCropSize = await getObjectSize(firstCrop.cropKey);
+      // Quick preflight: ensure at least one crop exists in R2
+      const firstCropSize = await getObjectSize(crops[0].cropKey);
       if (firstCropSize === null) {
         throw new Error(
-          `Crops not found in storage for job ${jobId}. First missing key="${firstCrop.cropKey}". Upload may be incomplete; re-upload required.`
+          `Crops not found in storage for job ${jobId}. First missing key="${crops[0].cropKey}".`
         );
       }
 
-      const cropUrlMap: CropMetaMap = Object.fromEntries(
-        cropsMeta.map((c) => [c.filename, c.cropSignedUrl])
-      );
       currentStep = JobStep.BATCH_SUBMITTED;
 
       if (currentStep === JobStep.BATCH_SUBMITTED) {
-        // Divide cropsMeta into chunks - start with default BATCH_SIZE
-        const batchSizeHint = loadBatchSizeHint(jobId);
-        let currentBatchSize = Math.max(
-          MIN_BATCH_SIZE,
-          Math.min(BATCH_SIZE, batchSizeHint ?? BATCH_SIZE)
-        );
+        const pendingStatuses: OcrCropStatus[] = [
+          OcrCropStatus.UPLOADED,
+          OcrCropStatus.FAILED_RETRYABLE,
+        ];
 
-        const cachedProcessedBatches = loadProcessedBatches(jobId).sort(
-          (a, b) => a.batchIndex - b.batchIndex
-        );
-        const processedItemsCountInitial = cachedProcessedBatches.reduce(
-          (sum, batch) => sum + batch.itemsCount,
-          0
-        );
-        const processedBatches: ProcessedBatchResult[] = cachedProcessedBatches.map(
-          ({ batchId, batchOutputFileId, batchIndex, startIndex, itemsCount }) => ({
-            batchId,
-            batchOutputFileId,
-            batchIndex,
-            startIndex,
-            itemsCount,
-          })
-        );
-        const persistedProcessedBatches: PersistedProcessedBatch[] = [...cachedProcessedBatches];
+        const waitForBatch = async (batchId: string, batchNo: number) => {
+          let attempt = 0;
+          while (true) {
+            const st = await step.run(
+              `${OcrStepId.WaitBatchCompletion}-${jobId}-batchNo-${batchNo}-attempt-${attempt}`,
+              () => getBatchStatus({ openai, batchId })
+            );
 
-        const remainingCrops = cropsMeta.slice(processedItemsCountInitial);
-        let cropsChunks = chunkArray(remainingCrops, currentBatchSize);
+            if (st.status === "completed" && st.outputFileId) {
+              return st;
+            }
 
-        let totalBatches = processedBatches.length + cropsChunks.length;
-        let processedItemsCount = processedItemsCountInitial;
+            if (st.status === "failed" || st.status === "cancelled") {
+              const failureMessage = await getBatchFailureMessage({
+                openai,
+                errorFileId: st.errorFileId,
+                failureReason: st.failureReason,
+              });
+              return { ...st, failureReason: failureMessage || st.failureReason };
+            }
+
+            await step.sleep(
+              `${OcrSleepId.WaitBatchCompletion}-${jobId}-batchNo-${batchNo}-attempt-${attempt}`,
+              BATCH_SLEEP_INTERVAL
+            );
+            attempt += 1;
+          }
+        };
+
+        const runRetryPasses = async (params: {
+          parentBatchId: string;
+          failedCropIds: string[];
+        }): Promise<void> => {
+          const retryPassSizes = [100, 50, 20, 10];
+          let pendingIds = Array.from(new Set(params.failedCropIds));
+
+          for (let pass = 0; pass < retryPassSizes.length && pendingIds.length > 0; pass += 1) {
+            const passSize = retryPassSizes[pass]!;
+            const nextPending: string[] = [];
+
+            for (let i = 0; i < pendingIds.length; i += passSize) {
+              const sliceIds = pendingIds.slice(i, i + passSize);
+              const sliceCrops = await getCropsByIds(sliceIds);
+
+              if (!sliceCrops.length) continue;
+
+              const batchNo = await getNextBatchNo(jobId);
+              const startIndex = sliceCrops[0].index;
+              const endIndexExclusive = sliceCrops[sliceCrops.length - 1].index + 1;
+
+              const batchId = await insertBatch({
+                jobId,
+                batchNo,
+                startIndex,
+                endIndexExclusive,
+                batchSize: sliceCrops.length,
+                kind: OcrBatchKind.RETRY,
+                parentBatchId: params.parentBatchId,
+                status: OcrBatchStatus.CREATED,
+                tokenLimitDetected: false,
+              });
+
+              try {
+                const artifacts = await step.run(
+                  `${OcrStepId.CreateAndAwaitBatch}-${jobId}-retry-batchNo-${batchNo}`,
+                  () =>
+                    createAndSubmitOpenAiBatch({
+                      jobId,
+                      batchNo,
+                      crops: sliceCrops,
+                      openai,
+                    })
+                );
+
+                await updateBatch(batchId, {
+                  openaiBatchId: artifacts.batchId,
+                  openaiInputFileId: artifacts.inputFileId,
+                  status: OcrBatchStatus.SUBMITTED,
+                  failureReason: null,
+                  tokenLimitDetected: false,
+                });
+
+                const st = await waitForBatch(artifacts.batchId, batchNo);
+
+                if (st.status !== "completed" || !st.outputFileId) {
+                  const msg = st.failureReason ?? "";
+                  const tokenLimited = msg ? isTokenLimitFailure(msg) : false;
+                  await updateBatch(batchId, {
+                    status:
+                      st.status === "cancelled"
+                        ? OcrBatchStatus.CANCELLED
+                        : OcrBatchStatus.FAILED,
+                    failureReason: msg || null,
+                    openaiErrorFileId: st.errorFileId,
+                    tokenLimitDetected: tokenLimited,
+                  });
+
+                  // If token-limited even on retry, keep items pending for next (smaller) pass.
+                  nextPending.push(...sliceIds);
+                  continue;
+                }
+
+                const parsed = await parseBatchOutputAndPersist({
+                  jobId,
+                  openai,
+                  outputFileId: st.outputFileId,
+                  crops: sliceCrops,
+                });
+
+                await updateBatch(batchId, {
+                  status: OcrBatchStatus.COMPLETED,
+                  openaiOutputFileId: st.outputFileId,
+                  openaiErrorFileId: st.errorFileId,
+                  failureReason: null,
+                });
+
+                // Any failures remain for next pass.
+                nextPending.push(...parsed.failedCropIds);
+              } catch (error) {
+                const tokenLimited = isTokenLimitError(error);
+                await updateBatch(batchId, {
+                  status: OcrBatchStatus.FAILED,
+                  failureReason: describeError(error),
+                  tokenLimitDetected: tokenLimited,
+                });
+
+                nextPending.push(...sliceIds);
+              }
+            }
+
+            pendingIds = Array.from(new Set(nextPending));
+          }
+
+          // Anything still pending after retries becomes FAILED_FINAL with empty text
+          if (pendingIds.length) {
+            await updateCropsStatus({
+              cropIds: pendingIds,
+              status: OcrCropStatus.FAILED_FINAL,
+            });
+
+            const failedCrops = await getCropsByIds(pendingIds);
+
+            await upsertFrames(
+              failedCrops.map((c) => ({
+                jobId,
+                filename: c.filename,
+                baseKey: c.baseKey,
+                index: c.index,
+                text: "",
+              }))
+            );
+          }
+        };
+
+        // Initialize batch size hint from last token-limited batch (if any)
+        const lastBatch = await getLastBatchSummary(jobId);
+
+        let currentBatchSize = BATCH_SIZE;
+        if (lastBatch?.tokenLimitDetected) {
+          currentBatchSize = adjustBatchSizeOnTokenError(lastBatch.batchSize);
+        }
+        currentBatchSize = Math.max(AI_CONSTANTS.BATCH.MIN_SIZE, currentBatchSize);
+
         let backoffMs = INITIAL_BACKOFF_MS;
 
-        progress.totalBatches = totalBatches;
-        progress.batchesCompleted = Math.max(progress.batchesCompleted ?? 0, processedBatches.length);
-        progress.submittedImages = Math.max(progress.submittedImages ?? 0, processedItemsCount);
-        await persistProgress(jobId, progress);
+        while (true) {
+          // Resume any in-flight batch first
+          const inFlight = await getInFlightBatch(jobId, [
+            OcrBatchStatus.SUBMITTED,
+            OcrBatchStatus.RUNNING,
+          ]);
 
-        if (processedBatches.length > 0) {
-          console.log(
-            `[retry] Reusing ${processedBatches.length} completed batch(es) for job ${jobId}; processedItems=${processedItemsCount}`
-          );
-        }
+          if (inFlight?.openaiBatchId) {
+            await updateBatch(inFlight.ocrJobBatchId, { status: OcrBatchStatus.RUNNING });
 
-        console.log(
-          `Processing ${totalImages} images in ${totalBatches} batches of ${currentBatchSize} images each for job ${jobId}`
-        );
+            const batchCrops = await getCropsForBatchRange({
+              jobId,
+              startIndex: inFlight.startIndex,
+              endIndexExclusive: inFlight.endIndexExclusive,
+            });
+            const st = await waitForBatch(inFlight.openaiBatchId, inFlight.batchNo);
 
-        // Process each pending batch chunk sequentially - wait for each batch to complete before starting the next
-        // Use while loop to handle dynamic re-chunking when batch size is reduced
-        let pendingIndex = 0;
-        while (pendingIndex < cropsChunks.length) {
-          const batchIndex = processedBatches.length + pendingIndex;
-          const chunk = cropsChunks[pendingIndex];
-          const globalStartIndex = processedItemsCount;
+            if (st.status !== "completed" || !st.outputFileId) {
+              const msg = st.failureReason ?? "";
+              const tokenLimited = msg ? isTokenLimitFailure(msg) : false;
+              await updateBatch(inFlight.ocrJobBatchId, {
+                status:
+                  st.status === "cancelled"
+                    ? OcrBatchStatus.CANCELLED
+                    : OcrBatchStatus.FAILED,
+                failureReason: msg || null,
+                openaiErrorFileId: st.errorFileId,
+                tokenLimitDetected: tokenLimited,
+              });
 
-          console.log(
-            `Creating batch ${batchIndex + 1}/${totalBatches} for job ${jobId} (images ${globalStartIndex + 1}-${globalStartIndex + chunk.length}) with batch size ${currentBatchSize}`
-          );
+              if (tokenLimited) {
+                currentBatchSize = adjustBatchSizeOnTokenError(currentBatchSize);
+                currentBatchSize = Math.max(AI_CONSTANTS.BATCH.MIN_SIZE, currentBatchSize);
+                await step.sleep(
+                  `${OcrSleepId.WaitBatchCompletion}-${jobId}-tokenLimitBackoff`,
+                  "60s"
+                );
+                continue;
+              }
 
-          let batchOutputFileId: string | null = null;
-          let lastBatchId: string | null = null;
-          let enqueueRetry = 0;
+              throw new Error(
+                `Batch failed. jobId=${jobId} batchNo=${inFlight.batchNo} status=${st.status} reason="${msg || "unknown"}"`
+              );
+            }
 
-          // Token limit can happen after the batch is created (status flips to failed).
-          // In that case we backoff + shrink batch size and re-create a new batch with a new step id.
-          while (true) {
+            const parsed = await step.run(
+              `${OcrStepId.SaveResultsToDb}-${jobId}-batchNo-${inFlight.batchNo}`,
+              () =>
+                parseBatchOutputAndPersist({
+                  jobId,
+                  openai,
+                  outputFileId: st.outputFileId!,
+                  crops: batchCrops,
+                })
+            );
+
+            await updateBatch(inFlight.ocrJobBatchId, {
+              status: OcrBatchStatus.COMPLETED,
+              openaiOutputFileId: st.outputFileId,
+              openaiErrorFileId: st.errorFileId,
+              failureReason: null,
+            });
+
+            if (parsed.failedCropIds.length) {
+              await runRetryPasses({
+                parentBatchId: inFlight.ocrJobBatchId,
+                failedCropIds: parsed.failedCropIds,
+              });
+            }
+
+            progress.batchesCompleted += 1;
+            await persistProgress(jobId, progress);
+            continue;
+          }
+
+          const pendingCrops = await getPendingCrops({
+            jobId,
+            statuses: pendingStatuses,
+            limit: currentBatchSize,
+          });
+
+          if (!pendingCrops.length) break;
+
+          const batchNo = await getNextBatchNo(jobId);
+          const startIndex = pendingCrops[0].index;
+          const endIndexExclusive = pendingCrops[pendingCrops.length - 1].index + 1;
+
+          const batchId = await insertBatch({
+            jobId,
+            batchNo,
+            startIndex,
+            endIndexExclusive,
+            batchSize: pendingCrops.length,
+            kind: OcrBatchKind.PRIMARY,
+            status: OcrBatchStatus.CREATED,
+            tokenLimitDetected: false,
+          });
+
+          try {
             const artifacts = await step.run(
-              `${OcrStepId.CreateAndAwaitBatch}-${batchIndex}-enqueueRetry-${enqueueRetry}`,
+              `${OcrStepId.CreateAndAwaitBatch}-${jobId}-batchNo-${batchNo}`,
               async () => {
                 let attempt = 0;
                 while (true) {
                   try {
-                    if (!chunk || chunk.length === 0) {
-                      throw new Error(`Empty chunk at batch index ${batchIndex}`);
-                    }
-
-                    console.log(
-                      `Attempting batch ${batchIndex + 1} with ${chunk.length} items (batch size: ${currentBatchSize}, attempt: ${attempt + 1})`
-                    );
-
-                    const result = await createBatchArtifacts({
+                    const result = await createAndSubmitOpenAiBatch({
                       jobId,
-                      cropsMeta: chunk,
-                      batchIndex,
-                      globalStartIndex,
+                      batchNo,
+                      crops: pendingCrops,
                       openai,
                     });
-
-                    await persistBatchSizeHint(jobId, currentBatchSize);
                     backoffMs = INITIAL_BACKOFF_MS;
                     return result;
                   } catch (error) {
-                    console.warn(
-                      `Batch ${batchIndex + 1} creation failed (attempt ${attempt + 1}): ${describeError(error)}`
-                    );
-
                     if (isTokenLimitError(error)) {
-                      const newSize = Math.max(MIN_BATCH_SIZE, Math.floor(currentBatchSize / 2));
-                      if (newSize >= currentBatchSize && currentBatchSize === MIN_BATCH_SIZE) {
-                        throw new Error(
-                          `Token limit at minimum batch size ${MIN_BATCH_SIZE}. Last error: ${error instanceof Error ? error.message : String(error)}`
-                        );
-                      }
-
-                      const remainingFromCurrent = cropsChunks
-                        .slice(pendingIndex)
-                        .reduce<CropMeta[]>((acc, curr) => acc.concat(curr), []);
-
-                      if (!remainingFromCurrent.length) {
-                        throw new Error(
-                          `Cannot retry batch ${batchIndex + 1}: no remaining crops to re-split after token limit`
-                        );
-                      }
-
-                      currentBatchSize = newSize;
-                      cropsChunks = chunkArray(remainingFromCurrent, currentBatchSize);
-                      totalBatches = processedBatches.length + cropsChunks.length;
-                      progress.totalBatches = totalBatches;
-                      await persistProgress(jobId, progress);
-
-                      console.warn(
-                        `Token/context limit for batch ${batchIndex + 1}; reducing batch size to ${currentBatchSize} and rechunking remaining ${remainingFromCurrent.length} crops into ${cropsChunks.length} batches`
-                      );
-
-                      pendingIndex = 0;
-                      attempt += 1;
-                      backoffMs = INITIAL_BACKOFF_MS;
-                      // Restart outer loop with new chunks
-                      return null as unknown as BatchArtifacts;
+                      throw error;
                     }
-
                     if (isRateLimitError(error) || isServerError(error)) {
                       const waitMs = backoffMs;
                       backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
-                      console.warn(
-                        `Rate/server limit for batch ${batchIndex + 1}. Waiting ${waitMs}ms before retry (next backoff ${backoffMs}ms)`
-                      );
                       await sleepMs(waitMs);
                       attempt += 1;
                       continue;
                     }
-
                     throw error;
                   }
                 }
               }
             );
 
-          if (!artifacts) {
-            // Batch size was reduced and chunks were rebuilt; restart loop with new chunks.
-            continue;
-          }
-
-            if (!artifacts || !artifacts.batchId) {
-              throw new Error(
-                `Batch ID missing after creation for batch ${batchIndex}.`
-              );
-            }
-            lastBatchId = artifacts.batchId;
-
-            // Use current chunk size (may have been reduced)
-            progress.submittedImages += chunk.length;
+            progress.submittedImages += pendingCrops.length;
             await persistProgress(jobId, progress);
 
-            console.log(
-              `Waiting for batch ${batchIndex + 1}/${totalBatches} (batchId: ${artifacts.batchId}) to complete for job ${jobId}`
+            await updateBatch(batchId, {
+              openaiBatchId: artifacts.batchId,
+              openaiInputFileId: artifacts.inputFileId,
+              status: OcrBatchStatus.SUBMITTED,
+              failureReason: null,
+              tokenLimitDetected: false,
+            });
+
+            const st = await waitForBatch(artifacts.batchId, batchNo);
+
+            if (st.status !== "completed" || !st.outputFileId) {
+              const msg = st.failureReason ?? "";
+              const tokenLimited = msg ? isTokenLimitFailure(msg) : false;
+
+              await updateBatch(batchId, {
+                status:
+                  st.status === "cancelled"
+                    ? OcrBatchStatus.CANCELLED
+                    : OcrBatchStatus.FAILED,
+                failureReason: msg || null,
+                openaiErrorFileId: st.errorFileId,
+                tokenLimitDetected: tokenLimited,
+              });
+
+              if (tokenLimited) {
+                currentBatchSize = adjustBatchSizeOnTokenError(currentBatchSize);
+                currentBatchSize = Math.max(AI_CONSTANTS.BATCH.MIN_SIZE, currentBatchSize);
+                await step.sleep(
+                  `${OcrSleepId.WaitBatchCompletion}-${jobId}-batchNo-${batchNo}-tokenLimitBackoff`,
+                  "60s"
+                );
+                continue;
+              }
+
+              throw new Error(
+                `Batch failed. jobId=${jobId} batchNo=${batchNo} status=${st.status} reason="${msg || "unknown"}"`
+              );
+            }
+
+            const parsed = await step.run(
+              `${OcrStepId.SaveResultsToDb}-${jobId}-batchNo-${batchNo}`,
+              () =>
+                parseBatchOutputAndPersist({
+                  jobId,
+                  openai,
+                  outputFileId: st.outputFileId!,
+                  crops: pendingCrops,
+                })
             );
 
-            // Wait for this batch to complete before processing the next one
-            // This ensures we don't exceed OpenAI rate limits and process sequentially
-            // Use separate steps for each check to allow proper sleep handling
-            let attempt = 0;
+            await updateBatch(batchId, {
+              status: OcrBatchStatus.COMPLETED,
+              openaiOutputFileId: st.outputFileId,
+              openaiErrorFileId: st.errorFileId,
+              failureReason: null,
+            });
 
-            while (true) {
-              const batchStatus = await step.run(
-                `${OcrStepId.WaitBatchCompletion}-${batchIndex}-enqueueRetry-${enqueueRetry}-${attempt}`,
-                () =>
-                  checkBatchStatus({
-                    batchId: artifacts.batchId,
-                    openai,
-                  })
-              );
+            if (parsed.failedCropIds.length) {
+              await runRetryPasses({
+                parentBatchId: batchId,
+                failedCropIds: parsed.failedCropIds,
+              });
+            }
 
-              if (
-                batchStatus.status === "completed" &&
-                batchStatus.outputFileId
-              ) {
-                batchOutputFileId = batchStatus.outputFileId;
-                break;
-              }
+            progress.batchesCompleted += 1;
+            await persistProgress(jobId, progress);
+          } catch (error) {
+            if (isTokenLimitError(error)) {
+              await updateBatch(batchId, {
+                status: OcrBatchStatus.FAILED,
+                failureReason: describeError(error),
+                tokenLimitDetected: true,
+              });
 
-              if (
-                batchStatus.status === "failed" ||
-                batchStatus.status === "cancelled"
-              ) {
-                const failureMessage = await getBatchFailureMessage({
-                  openai,
-                  errorFileId: batchStatus.errorFileId,
-                  failureReason: batchStatus.failureReason,
-                });
-
-                if (failureMessage && isTokenLimitFailure(failureMessage)) {
-                  const nextBatchSize = adjustBatchSizeOnTokenError(currentBatchSize);
-
-                  console.warn(
-                    `[token-limit] Batch failed after creation. jobId=${jobId} batchIndex=${batchIndex} status=${batchStatus.status} ` +
-                      `currentBatchSize=${currentBatchSize} nextBatchSize=${nextBatchSize} enqueueRetry=${enqueueRetry} ` +
-                      `message="${failureMessage}"`
-                  );
-
-                  // Backoff a bit to let other in-progress batches complete and free enqueued tokens.
-                  await step.sleep(
-                    `${OcrSleepId.WaitBatchCompletion}-${jobId}-${batchIndex}-tokenLimitBackoff-${enqueueRetry}`,
-                    "60s"
-                  );
-
-                  // If we can shrink, do it and re-chunk the remaining items from the current cursor.
-                  if (nextBatchSize !== currentBatchSize) {
-                    currentBatchSize = nextBatchSize;
-                  }
-                  const remaining = cropsMeta.slice(processedItemsCount);
-                  cropsChunks = chunkArray(remaining, currentBatchSize);
-                  totalBatches = processedBatches.length + cropsChunks.length;
-                  progress.totalBatches = totalBatches;
-                  await persistProgress(jobId, progress);
-
-                  // Restart from the first chunk of remaining items with a new batch creation step id.
-                  pendingIndex = 0;
-                  batchOutputFileId = null;
-                  enqueueRetry += 1;
-                  break;
-                }
-
+              const next = adjustBatchSizeOnTokenError(currentBatchSize);
+              if (next === currentBatchSize && currentBatchSize === AI_CONSTANTS.BATCH.MIN_SIZE) {
                 throw new Error(
-                  `Batch ${batchIndex} failed with status=${batchStatus.status}. outputFileId=${batchStatus.outputFileId ?? "null"} errorFileId=${batchStatus.errorFileId ?? "null"} reason="${failureMessage || batchStatus.failureReason || "unknown"}"`
+                  `Token limit at minimum batch size ${AI_CONSTANTS.BATCH.MIN_SIZE}. Last error: ${describeError(error)}`
                 );
               }
-
-              // Sleep before next check - this must be outside step.run
-              await step.sleep(
-                `${OcrSleepId.WaitBatchCompletion}-${jobId}-${batchIndex}-enqueueRetry-${enqueueRetry}-${attempt}`,
-                BATCH_SLEEP_INTERVAL
-              );
-              attempt += 1;
-            }
-
-            // If we broke out due to token-limit retry, restart create/wait.
-            if (!batchOutputFileId) {
+              currentBatchSize = Math.max(AI_CONSTANTS.BATCH.MIN_SIZE, next);
               continue;
             }
-
-            break;
+            await updateBatch(batchId, {
+              status: OcrBatchStatus.FAILED,
+              failureReason: describeError(error),
+            });
+            throw error;
           }
-
-          progress.batchesCompleted += 1;
-          await persistProgress(jobId, progress);
-
-          console.log(
-            `Batch ${batchIndex + 1}/${totalBatches} completed for job ${jobId}`
-          );
-
-          const processedBatch: ProcessedBatchResult = {
-            batchId: lastBatchId ?? "unknown",
-            batchOutputFileId,
-            batchIndex,
-            startIndex: globalStartIndex,
-            itemsCount: chunk.length,
-          };
-          processedBatches.push(processedBatch);
-          persistedProcessedBatches.push({
-            ...processedBatch,
-          });
-          await persistProcessedBatches(
-            jobId,
-            persistedProcessedBatches
-          );
-
-          // Update counters for next iteration
-          processedItemsCount += chunk.length;
-          pendingIndex += 1;
-
-          // Update job with the last batch info (for tracking purposes)
-          // Batch info is no longer stored in ocrJobs table
-          // It's tracked in processedBatches array
         }
 
-        console.log(
-          `All ${totalBatches} batches completed for job ${jobId}. Processing results...`
-        );
-
-        await db
-          .update(ocrJobs)
-          .set({
-            step: JobStep.RESULTS_SAVED,
-          })
-          .where(eq(ocrJobs.jobId, jobId));
-
-        currentStep = JobStep.RESULTS_SAVED;
-
-        // Save all batch results (processedImages se queda para preprocesado)
-        await step.run(OcrStepId.SaveResultsToDb, () =>
-          saveBatchResults({
-            jobId,
-            processedBatches,
-            openai,
-            cropUrlMap,
-            cropsMeta,
-          })
-        );
-
-        progress.batchesCompleted = totalBatches;
-        await persistProgress(jobId, progress, { step: JobStep.RESULTS_SAVED });
-
+        await updateJob(jobId, { step: JobStep.RESULTS_SAVED });
         currentStep = JobStep.DOCS_BUILT;
       }
 
@@ -1943,30 +1361,34 @@ export const processOcrJob = inngest.createFunction(
             jobId,
             paths: workspacePaths,
             storageKeys,
-            totalImages,
           })
         );
 
+        // Cleanup storage: delete crops and delete RAW_ZIP (input)
+        await deleteObjectsByPrefix(`users/${userId}/${jobId}/crops/`);
+        const rawZipKey = await getJobItemByType(jobId, JobItemType.RAW_ZIP);
+        if (rawZipKey) {
+          await deleteObjectIfExists(rawZipKey).catch(() => undefined);
+          await deleteJobItemByType(jobId, JobItemType.RAW_ZIP);
+        }
+
         // Ensure the job reflects the final step in case any prior update was skipped
-        await db
-          .update(ocrJobs)
-          .set({
-            step: JobStep.DOCS_BUILT,
-            status: JobsStatus.DONE,
-          })
-          .where(eq(ocrJobs.jobId, jobId));
+        await updateJob(jobId, {
+          step: JobStep.DOCS_BUILT,
+          status: JobsStatus.DONE,
+        });
       }
 
       // Get final keys from items
       const finalTxtKey = await getJobItemByType(jobId, JobItemType.TXT_DOCUMENT);
       const finalDocxKey = await getJobItemByType(jobId, JobItemType.DOCX_DOCUMENT);
-      const finalRawZipKey = await getJobItemByType(jobId, JobItemType.RAW_ZIP);
+      const finalOriginalZipKey = await getJobItemByType(jobId, JobItemType.ORIGINAL_ZIP);
 
       return {
         jobId,
         txtKey: finalTxtKey ?? storageKeys.txtKey,
         docxKey: finalDocxKey ?? storageKeys.docxKey,
-        rawZipKey: finalRawZipKey,
+        rawZipKey: finalOriginalZipKey,
       };
     } catch (err) {
       const errorMessage =
@@ -1976,13 +1398,10 @@ export const processOcrJob = inngest.createFunction(
       console.error(errorWithContext, err);
 
       // Guardar error y marcar job como ERROR; el retry lo relanza desde el step que quedó
-      await db
-        .update(ocrJobs)
-        .set({
-          status: JobsStatus.ERROR,
-          error: errorWithContext,
-        })
-        .where(eq(ocrJobs.jobId, jobId));
+      await updateJob(jobId, {
+        status: JobsStatus.ERROR,
+        error: errorWithContext,
+      });
 
       throw err;
     }

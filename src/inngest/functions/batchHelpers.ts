@@ -1,4 +1,5 @@
-export const MIN_BATCH_SIZE = 50;
+import { AI_CONSTANTS } from "@/constants/ai.constants";
+
 export const INITIAL_BACKOFF_MS = 2_000;
 export const MAX_BACKOFF_MS = 30_000;
 
@@ -52,8 +53,31 @@ export const describeError = (error: unknown): string => {
   return status ? `status=${status} message=${message}` : message;
 };
 
-export const adjustBatchSizeOnTokenError = (current: number, min = MIN_BATCH_SIZE): number => {
+export const adjustBatchSizeOnTokenError = (
+  current: number,
+  min = AI_CONSTANTS.BATCH.MIN_SIZE,
+  steps: readonly number[] = AI_CONSTANTS.BATCH.SIZE_STEPS
+): number => {
   if (current <= min) return min;
-  return Math.max(min, Math.floor(current / 2));
+  
+  // Find the next step down from current size
+  // If current is 400, it should go to 300; if 300, go to 200, etc.
+  // Steps are ordered from highest to lowest: [400, 300, 200, 100, 50]
+  for (let i = 0; i < steps.length; i++) {
+    // If current is greater than or equal to this step, find the next lower step
+    if (current >= steps[i]) {
+      // Find the next step down (if available)
+      for (let j = i + 1; j < steps.length; j++) {
+        if (steps[j] >= min) {
+          return steps[j];
+        }
+      }
+      // If no lower step found, return minimum
+      return min;
+    }
+  }
+  
+  // If current is smaller than all steps, return minimum
+  return min;
 };
 

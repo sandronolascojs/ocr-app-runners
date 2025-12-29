@@ -61,9 +61,14 @@ Output format:
 
 export const AI_CONSTANTS = {
   MODELS: {
-    OPENAI: "gpt-4.1",
+    OPENAI: "gpt-4.1-mini",
   },
   PROMPTS: {
     OCR: OCR_PROMPT,
+  },
+  BATCH: {
+    DEFAULT_SIZE: 1000,
+    MIN_SIZE: 50,
+    SIZE_STEPS: [400, 300, 200, 100, 50] as const,
   },
 };

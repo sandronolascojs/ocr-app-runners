@@ -2,6 +2,9 @@ import { JobsStatus } from "@/types";
 import { JobStep } from "@/types/enums/jobs/jobStep.enum";
 import { JobItemType } from "@/types/enums/jobs/jobItemType.enum";
 import { JobType } from "@/types/enums/jobs/jobType.enum";
+import { OcrBatchKind } from "@/types/enums/jobs/ocrBatchKind.enum";
+import { OcrBatchStatus } from "@/types/enums/jobs/ocrBatchStatus.enum";
+import { OcrCropStatus } from "@/types/enums/jobs/ocrCropStatus.enum";
 import { ApiKeyProvider } from "@/types/enums/apiKeyProvider.enum";
 import { TeamRole } from "@/types/enums/teamRole.enum";
 import { pgEnum } from "drizzle-orm/pg-core";
@@ -33,6 +36,27 @@ export const jobItemTypeEnum = pgEnum("job_item_type", [
 export const jobTypeEnum = pgEnum("job_type", [
   JobType.OCR,
   JobType.SUBTITLE_REMOVAL,
+]);
+
+export const ocrCropStatusEnum = pgEnum("ocr_crop_status", [
+  OcrCropStatus.UPLOADED,
+  OcrCropStatus.PROCESSED,
+  OcrCropStatus.FAILED_RETRYABLE,
+  OcrCropStatus.FAILED_FINAL,
+]);
+
+export const ocrBatchKindEnum = pgEnum("ocr_batch_kind", [
+  OcrBatchKind.PRIMARY,
+  OcrBatchKind.RETRY,
+]);
+
+export const ocrBatchStatusEnum = pgEnum("ocr_batch_status", [
+  OcrBatchStatus.CREATED,
+  OcrBatchStatus.SUBMITTED,
+  OcrBatchStatus.RUNNING,
+  OcrBatchStatus.COMPLETED,
+  OcrBatchStatus.FAILED,
+  OcrBatchStatus.CANCELLED,
 ]);
 
 export const apiKeyProviderEnum = pgEnum("api_key_provider", [

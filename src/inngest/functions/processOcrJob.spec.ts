@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 
+import { AI_CONSTANTS } from "@/constants/ai.constants";
 import {
-  MIN_BATCH_SIZE,
   adjustBatchSizeOnTokenError,
   describeError,
   getStatusCode,
@@ -58,7 +58,7 @@ describe("batchHelpers", () => {
   });
 
   it("MIN_BATCH_SIZE is enforced in helper", () => {
-    expect(adjustBatchSizeOnTokenError(MIN_BATCH_SIZE - 10)).toBe(MIN_BATCH_SIZE);
+    expect(adjustBatchSizeOnTokenError(AI_CONSTANTS.BATCH.MIN_SIZE - 10)).toBe(AI_CONSTANTS.BATCH.MIN_SIZE);
   });
 
   it("simulates token-limit shrink and rechunk end-to-end", () => {
