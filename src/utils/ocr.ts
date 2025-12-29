@@ -253,10 +253,20 @@ export const compareImageFilenames = (a: string, b: string): number => {
 
 /**
  * Devuelve la "clave base" numérica de un filename.
- * 3.png → "3", 3-1.png → "3", 3_2.jpeg → "3", 12-3.png → "12".
+ * Supports: ., -, and _ as separators
+ * Examples:
+ * - 3.png → "3"
+ * - 3-1.png → "3"
+ * - 3_2.jpeg → "3"
+ * - 3.1.png → "3"
+ * - 12-3.png → "12"
+ * - 12.3.4.png → "12"
  */
 export function getBaseKeyFromFilename(filename: string): string {
-  const name = filename.replace(/\.[^.]+$/, "");
+  // Remove extension
+  const name = filename.replace(/\.(png|jpe?g)$/i, "");
+  // Extract first number (supports ., -, _ as separators)
+  // Matches: 1, 1.1, 1-1, 1_1, 12.3.4, etc.
   const match = name.match(/^(\d+)/);
   if (!match) return name;
   return String(parseInt(match[1], 10));
