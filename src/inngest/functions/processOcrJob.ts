@@ -47,11 +47,13 @@ import {
   getJobOriginalZipKey,
   getJobTxtKey,
   getJobThumbnailKey,
+  getJobZipKey,
   uploadFileToObject,
   uploadBufferToObject,
   uploadStreamToObject,
   downloadObjectToTempFileVerified,
   getObjectSize,
+  deleteObjectIfExists,
 } from "@/utils/storage";
 import { forEachZipEntry, readStreamToBuffer } from "@/utils/zip/zipFile";
 import { env } from "@/config/env.config";
@@ -675,6 +677,19 @@ export const processOcrJob = inngest.createFunction(
         userId,
         paths: workspacePaths,
       });
+
+      // Step 11.5: Delete raw zip (input.zip) from R2 and tmp after successful processing
+      const rawZipKey = getJobZipKey(userId, jobId);
+      try {
+        console.log(`[ocr-worker] [MAIN] Deleting raw zip from R2: jobId=${jobId}, key=${rawZipKey}`);
+        await deleteObjectIfExists(rawZipKey);
+        console.log(`[ocr-worker] [MAIN] Successfully deleted raw zip from R2: jobId=${jobId}`);
+      } catch (error) {
+        // Log but don't fail the job if deletion fails
+        console.warn(`[ocr-worker] [MAIN] Failed to delete raw zip from R2: jobId=${jobId}, error=${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      // Raw zip from tmp is already deleted in cleanupJobArtifacts (zipPath)
 
       // Step 12: Mark job as done
       await updateJob(jobId, {
