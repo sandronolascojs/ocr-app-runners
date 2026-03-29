@@ -4,6 +4,7 @@ import { inngest } from './inngest/client';
 import { env } from './config/env.config';
 import { processOcrJob } from './inngest/functions/processOcrJob';
 import { removeSubtitlesFromImages } from './inngest/functions/removeSubtitles';
+import { cleanupOldJobFiles } from './inngest/functions/cleanupOldJobFiles';
 
 const fastify = Fastify({
   logger: true,
@@ -19,6 +20,7 @@ fastify.route({
     functions: [
       processOcrJob,
       removeSubtitlesFromImages,
+      cleanupOldJobFiles,
     ],
   }),
   url: '/api/inngest',

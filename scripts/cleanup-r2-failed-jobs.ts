@@ -1,9 +1,9 @@
 #!/usr/bin/env tsx
 
 /**
- * Cleanup script that deletes R2 objects for non-completed jobs while keeping
- * every object that belongs to jobs marked as DONE. It also removes failed
- * jobs from the database to keep records consistent.
+ * Cleanup script that deletes R2 objects for non-DONE jobs (PROCESSING, PENDING, ERROR)
+ * while keeping every object that belongs to jobs marked as DONE. It also removes
+ * all non-DONE jobs from the database to keep records consistent.
  *
  * Usage:
  *   pnpm tsx scripts/cleanup-r2-failed-jobs.ts
@@ -51,7 +51,12 @@ const r2Client = new S3Client({
 const BUCKET_NAME = env.CLOUDFLARE_R2_BUCKET_NAME;
 const DELETE_BATCH_SIZE = 1000; // S3/R2 limit
 const PROTECTED_STATUSES: JobsStatus[] = [JobsStatus.DONE];
-const FAILED_STATUSES: JobsStatus[] = [JobsStatus.ERROR];
+// Delete jobs that are not DONE (PROCESSING, PENDING, ERROR)
+const DELETE_STATUSES: JobsStatus[] = [
+  JobsStatus.PROCESSING,
+  JobsStatus.PENDING,
+  JobsStatus.ERROR,
+];
 
 interface ObjectInfo {
   key: string;
@@ -412,13 +417,13 @@ const abortAllMultipartUploads = async (): Promise<number> => {
   return abortedCount;
 };
 
-const deleteFailedJobsFromDb = async (failedJobs: JobPrefix[]): Promise<number> => {
-  if (failedJobs.length === 0) {
-    console.log("No failed jobs to remove from the database.");
+const deleteNonDoneJobsFromDb = async (jobsToDelete: JobPrefix[]): Promise<number> => {
+  if (jobsToDelete.length === 0) {
+    console.log("No non-DONE jobs to remove from the database.");
     return 0;
   }
 
-  const jobIds = failedJobs.map((job) => job.jobId);
+  const jobIds = jobsToDelete.map((job) => job.jobId);
 
   const deleted = await db.delete(ocrJobs).where(inArray(ocrJobs.jobId, jobIds));
 
@@ -427,7 +432,7 @@ const deleteFailedJobsFromDb = async (failedJobs: JobPrefix[]): Promise<number> 
     ? deleted.rowCount
     : jobIds.length;
 
-  console.log(`Removed ${rowCount} failed job record(s) from the database.`);
+  console.log(`Removed ${rowCount} non-DONE job record(s) from the database.`);
 
   return rowCount;
 };
@@ -451,19 +456,20 @@ const main = async () => {
   console.log("=".repeat(60));
 
   if (!force) {
-    console.log("\nWARNING: This script will delete objects for non-completed jobs and remove failed jobs from the database.");
+    console.log("\nWARNING: This script will delete objects for non-DONE jobs (PROCESSING, PENDING, ERROR)");
+    console.log("and remove them from the database. Only DONE jobs will be kept.");
     console.log("Press Ctrl+C to cancel.\n");
     console.log("To proceed without waiting, use: --force\n");
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
 
-  const [protectedPrefixes, failedJobPrefixes] = await Promise.all([
+  const [protectedPrefixes, jobsToDelete] = await Promise.all([
     fetchJobPrefixesByStatus(PROTECTED_STATUSES),
-    fetchJobPrefixesByStatus(FAILED_STATUSES),
+    fetchJobPrefixesByStatus(DELETE_STATUSES),
   ]);
 
   console.log(`Protected job prefixes (DONE): ${protectedPrefixes.length}`);
-  console.log(`Failed jobs to purge from DB: ${failedJobPrefixes.length}`);
+  console.log(`Non-DONE jobs to purge from DB and R2: ${jobsToDelete.length}`);
 
   const multipartCount = await listAllMultipartUploads();
   if (multipartCount > 0) {
@@ -479,8 +485,8 @@ const main = async () => {
   console.log(`  Objects total: ${objects.length}`);
   console.log(`  Objects protected (DONE jobs): ${skippedSummary.count} (${formatBytes(skippedSummary.totalSize)})`);
   console.log(`  Objects to delete: ${deletableSummary.count} (${formatBytes(deletableSummary.totalSize)})`);
-  if (failedJobPrefixes.length > 0) {
-    console.log(`  Failed jobs scheduled for DB deletion: ${failedJobPrefixes.length}`);
+  if (jobsToDelete.length > 0) {
+    console.log(`  Non-DONE jobs scheduled for DB deletion: ${jobsToDelete.length}`);
   }
   console.log("=".repeat(60));
 
@@ -490,13 +496,13 @@ const main = async () => {
   }
 
   const deletedCount = await deleteAllObjects(deletable);
-  await deleteFailedJobsFromDb(failedJobPrefixes);
+  await deleteNonDoneJobsFromDb(jobsToDelete);
 
   console.log("\n".repeat(1) + "=".repeat(60));
   console.log("Cleanup complete:");
   console.log(`  Objects deleted: ${deletedCount}`);
-  console.log(`  Objects kept (completed jobs): ${skippedSummary.count}`);
-  console.log(`  Failed DB jobs removed: ${failedJobPrefixes.length}`);
+  console.log(`  Objects kept (DONE jobs): ${skippedSummary.count}`);
+  console.log(`  Non-DONE DB jobs removed: ${jobsToDelete.length}`);
   console.log("=".repeat(60));
 };
 
