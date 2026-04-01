@@ -1,49 +1,30 @@
-import { serve } from 'inngest/fastify';
-import Fastify from 'fastify';
+import express from 'express';
+import { serve } from 'inngest/express';
 import { inngest } from './inngest/client';
 import { env } from './config/env.config';
 import { processOcrJob } from './inngest/functions/processOcrJob';
 import { removeSubtitlesFromImages } from './inngest/functions/removeSubtitles';
 import { cleanupOldJobFiles } from './inngest/functions/cleanupOldJobFiles';
 
-const fastify = Fastify({
-  logger: true,
-  requestTimeout: 0,
-  connectionTimeout: 0,
-});
-
+const app = express();
 const port = env.PORT;
 
-// Inngest serve endpoint
-fastify.route({
-  method: ['GET', 'POST', 'PUT'],
-  handler: serve({
-    client: inngest,
-    functions: [
-      processOcrJob,
-      removeSubtitlesFromImages,
-      cleanupOldJobFiles,
-    ],
-    streaming: true,
-  }),
-  url: '/api/inngest',
+app.use('/api/inngest', serve({
+  client: inngest,
+  functions: [
+    processOcrJob,
+    removeSubtitlesFromImages,
+    cleanupOldJobFiles,
+  ],
+  streaming: true,
+}));
+
+app.get('/health', (_req, res) => {
+  res.status(200).json({ status: 'ok' });
 });
 
-// Health check endpoint
-fastify.get('/health', async (_request, reply) => {
-  return reply.status(200).send({ status: 'ok' });
+app.listen(port, '0.0.0.0', () => {
+  console.log(`Inngest server running on port ${port}`);
+  console.log(`Inngest endpoint: http://localhost:${port}/api/inngest`);
 });
-
-const start = async () => {
-  try {
-    await fastify.listen({ port, host: '0.0.0.0' });
-    console.log(`Inngest server running on port ${port}`);
-    console.log(`Inngest endpoint: http://localhost:${port}/api/inngest`);
-  } catch (err) {
-    fastify.log.error(err);
-    process.exit(1);
-  }
-};
-
-start();
 
