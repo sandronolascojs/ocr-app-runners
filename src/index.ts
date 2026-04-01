@@ -9,6 +9,8 @@ import { cleanupOldJobFiles } from './inngest/functions/cleanupOldJobFiles';
 const app = express();
 const port = env.PORT;
 
+app.use(express.json({ limit: '10mb' }));
+
 app.use('/api/inngest', serve({
   client: inngest,
   functions: [
