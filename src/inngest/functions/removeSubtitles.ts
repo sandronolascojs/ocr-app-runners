@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import archiver from "archiver";
 import { Transform } from "node:stream";
 import { inngest } from "@/inngest/client";
+import type { InngestFunction } from "inngest";
 import { db } from "@/db";
 import { ocrJobs, ocrJobItems } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
@@ -267,14 +268,14 @@ const streamAndRemoveSubtitles = async ({
   });
 };
 
-export const removeSubtitlesFromImages = inngest.createFunction(
+export const removeSubtitlesFromImages: InngestFunction.Any = inngest.createFunction(
   {
     id: InngestFunctions.REMOVE_SUBTITLES_FROM_IMAGES,
+    triggers: [{ event: InngestEvents.REMOVE_SUBTITLES }],
     timeouts: {
-      finish: "2h",
+      finish: "24h",
     },
   },
-  { event: InngestEvents.REMOVE_SUBTITLES },
   async ({ event, step }): Promise<{
     jobId: string;
     croppedZipKey: string | null;

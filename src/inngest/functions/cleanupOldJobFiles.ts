@@ -1,4 +1,5 @@
 import { inngest } from "@/inngest/client";
+import type { InngestFunction } from "inngest";
 import { InngestFunctions } from "@/types/enums/inngest/inngestFunctions.enum";
 import { db } from "@/db";
 import { ocrJobs, ocrJobItems } from "@/db/schema";
@@ -8,12 +9,12 @@ import { getJobRootKey } from "@/utils/storage/keys";
 
 const RETENTION_DAYS = 30;
 
-export const cleanupOldJobFiles = inngest.createFunction(
+export const cleanupOldJobFiles: InngestFunction.Any = inngest.createFunction(
   {
     id: InngestFunctions.CLEANUP_OLD_JOB_FILES,
+    triggers: [{ cron: "0 3 * * *" }],
     concurrency: { limit: 1 },
   },
-  { cron: "0 3 * * *" }, // every day at 3 AM
   async ({ step, logger }) => {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - RETENTION_DAYS);

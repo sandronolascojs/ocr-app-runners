@@ -8,6 +8,8 @@ import { cleanupOldJobFiles } from './inngest/functions/cleanupOldJobFiles';
 
 const fastify = Fastify({
   logger: true,
+  requestTimeout: 0,
+  connectionTimeout: 0,
 });
 
 const port = env.PORT;
@@ -22,6 +24,7 @@ fastify.route({
       removeSubtitlesFromImages,
       cleanupOldJobFiles,
     ],
+    streaming: true,
   }),
   url: '/api/inngest',
 });

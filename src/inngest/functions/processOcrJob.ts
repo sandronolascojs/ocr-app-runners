@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import archiver from "archiver";
 import { Transform } from "node:stream";
 import { inngest } from "@/inngest/client";
+import type { InngestFunction } from "inngest";
 import type { SelectOcrJob } from "@/db/schema/jobs";
 import {
   validateProcessableImageEntry,
@@ -550,14 +551,14 @@ const ensureWorkspaceLayout = async (paths: WorkspacePaths): Promise<void> => {
 // MAIN INNGEST FUNCTION
 // ============================================================================
 
-export const processOcrJob = inngest.createFunction(
+export const processOcrJob: InngestFunction.Any = inngest.createFunction(
   {
     id: InngestFunctions.PROCESS_OCR_JOB,
+    triggers: [{ event: InngestEvents.ZIP_UPLOADED }],
     timeouts: {
-      finish: "2h", // Maximum allowed timeout for processing large batches of images
+      finish: "24h",
     },
   },
-  { event: InngestEvents.ZIP_UPLOADED },
   async ({ event, step }): Promise<{
     jobId: string;
     txtKey: string;
